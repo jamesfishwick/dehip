@@ -1,0 +1,20 @@
+# corpora, held-out sets, metric runs
+data/*
+!data/.gitkeep
+results/*
+!results/.gitkeep
+
+# model artifacts
+*.gguf
+*.safetensors
+*.bin
+adapters/
+
+# env and python
+.env
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store

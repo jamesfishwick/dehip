@@ -1,0 +1,13 @@
+Given the a prompt, candidate A, and candidate B, choose which is the better response, based off of quality of the writing and following the prompt. Return which one is better, either A or B:
+
+=== PROMPT ===
+
+{prompt}
+
+=== CANDIDATE A ===
+
+{candidate_a}
+
+=== CANDIDATE B ===
+
+{candidate_b}

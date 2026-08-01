@@ -1,0 +1,17 @@
+Given the prompt, candidate A, and candidate B, choose which response has more depth.
+
+Depth means the response goes beyond surface-level points, develops ideas with substance, gives meaningful detail, and shows insight appropriate to the assignment.
+
+Return only A or B.
+
+=== PROMPT ===
+
+{prompt}
+
+=== CANDIDATE A ===
+
+{candidate_a}
+
+=== CANDIDATE B ===
+
+{candidate_b}

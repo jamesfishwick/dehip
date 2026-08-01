@@ -1,0 +1,17 @@
+Given the prompt, candidate A, and candidate B, choose which response is more relevant to the prompt.
+
+Relevance means the response follows the user's assignment, respects stated constraints, addresses the requested topic, and avoids drifting into unrelated material.
+
+Return only A or B.
+
+=== PROMPT ===
+
+{prompt}
+
+=== CANDIDATE A ===
+
+{candidate_a}
+
+=== CANDIDATE B ===
+
+{candidate_b}
