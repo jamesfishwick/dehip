@@ -3,6 +3,8 @@ data/*
 !data/.gitkeep
 results/*
 !results/.gitkeep
+data/emb-cache/
+results/runs/
 
 # model artifacts
 *.gguf
