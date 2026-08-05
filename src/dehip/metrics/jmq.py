@@ -18,15 +18,28 @@ Design invariants
   used across all six dimensions for that pair (positional placement is a
   property of the pair, not the dimension). The distribution is ~50/50 over many
   pairs (data-model.md, Story 1 scenario 4).
-- **Verdicts are persisted before aggregation (FR-008).** Every judge call
-  yields a :class:`~dehip.schemas.JudgeVerdict` written to JSONL *before* any
-  score is computed. Aggregation then reads *only* that file, so a crash between
-  judging and scoring loses nothing: rerun the aggregation over the persisted
-  verdicts and JMQ is recomputed without re-querying the judge.
+- **Each verdict is persisted as it completes (FR-008).** Worker threads compute
+  concurrently, but a single writer appends every completed
+  :class:`~dehip.schemas.JudgeVerdict` to the JSONL the moment it is ready,
+  *before* any score is computed. So a crash, an unhandled exception, or a judge
+  that fails partway through leaves *all* verdicts completed so far durably on
+  disk, and aggregation (which reads *only* that file) recomputes JMQ over them
+  without re-querying the judge. The per-pair A/B order is frozen before any
+  thread starts, so verdict *content* is reproducible from the seed even though
+  the on-disk line order is completion order (aggregation groups by pair and
+  dimension, so line order does not affect the result).
+- **Transient judge errors are retried, then counted, never fatal.** Each judge
+  call is retried with bounded backoff on a transient error (timeout, connection
+  reset, 429, 5xx). If every attempt fails, the run does *not* abort: the
+  (pair, dimension) is recorded as an excluded-and-counted verdict
+  (``choice="invalid"``, ``model_won=None``, the exception text in
+  ``raw_response``) so the shortfall surfaces in the per-dimension ``invalid``
+  count, and the remaining calls continue.
 - **Malformed verdicts are excluded-and-counted, never silently scored.** A
   response that does not parse to A or B is retried once; if it still fails it is
   recorded with ``choice="invalid"`` and surfaced in the per-dimension
-  ``invalid`` count, not dropped (spec edge-case rule).
+  ``invalid`` count, not dropped (spec edge-case rule). A give-up after transient
+  errors folds into the same ``invalid`` bucket.
 - **Cost preflight before spend (FR-009).** :func:`estimate_call_count` and
   :func:`cost_preflight` report the call count (pairs x 6 dimensions) and refuse
   to proceed above a spend threshold unless the caller explicitly confirms.
@@ -38,10 +51,12 @@ injectable :class:`JudgeClient` protocol. Production uses
 
 from __future__ import annotations
 
+import json
 import random
+import time
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -50,7 +65,6 @@ from dehip.schemas import (
     JudgeVerdict,
     content_sha256,
     read_jsonl,
-    write_jsonl,
 )
 
 __all__ = [
@@ -87,6 +101,12 @@ assert set(DIMENSION_ORDER) == set(DIMENSIONS), (
 )
 
 DEFAULT_JUDGE_MODEL = "gpt-5.4-mini"
+
+# Bounded retry for transient judge-call errors (timeout, connection reset, 429,
+# 5xx). A few attempts with a short exponential backoff; on give-up the call is
+# recorded as a counted failure marker rather than aborting the paid run.
+DEFAULT_JUDGE_MAX_ATTEMPTS = 3
+DEFAULT_JUDGE_BACKOFF_SECONDS = 0.1
 
 # Per-pair spend estimate for the preflight. The dollar figure the DFT protocol
 # implies is not published; this is a deliberately conservative placeholder the
@@ -164,17 +184,37 @@ class JudgePrompts:
     source_dir: str
 
 
+def _is_judge_prompts_dir(candidate: Path) -> bool:
+    """Whether ``candidate`` is a genuine ``judge-prompts/`` dir, not a namesake.
+
+    A bare ``judge-prompts/`` name is not enough: an unrelated ancestor could
+    hold a directory by that name. Accept it only when it is anchored to *this*
+    repo -- either its parent is a repo root (has ``pyproject.toml`` or ``.git``)
+    or the directory already contains all six expected ``<dimension>.txt`` files.
+    """
+    if not candidate.is_dir():
+        return False
+    parent = candidate.parent
+    if (parent / "pyproject.toml").is_file() or (parent / ".git").exists():
+        return True
+    return all(
+        (candidate / f"{dimension}.txt").is_file() for dimension in DIMENSION_ORDER
+    )
+
+
 def _find_prompts_dir(start: Path) -> Path:
     """Walk up from ``start`` to the repo root holding ``judge-prompts/``.
 
     The templates live at the repository root (plan.md: "judge-prompts/ ... stay
     as-is"), outside the installed package, so the module locates them by
-    ascending its own path. Raises if no ancestor contains the directory rather
-    than silently substituting an empty prompt set.
+    ascending its own path. A candidate is accepted only if it is anchored to the
+    repo (see :func:`_is_judge_prompts_dir`), so an unrelated namesake directory
+    is skipped. Raises if no ancestor has a genuine one rather than silently
+    substituting an empty prompt set.
     """
     for parent in [start, *start.parents]:
         candidate = parent / "judge-prompts"
-        if candidate.is_dir():
+        if _is_judge_prompts_dir(candidate):
             return candidate
     raise FileNotFoundError(
         "could not locate a 'judge-prompts/' directory in any parent of "
@@ -280,7 +320,35 @@ def _model_won(choice: str, order: str) -> bool | None:
     return choice == "B"
 
 
-# --- Judging (one call per pair x dimension, persisted before aggregation) ---
+# --- Judging (one call per pair x dimension, persisted as each completes) ----
+
+
+def _call_judge_with_retry(
+    client: JudgeClient,
+    rendered: str,
+    model: str,
+    *,
+    max_attempts: int,
+    backoff_seconds: float,
+) -> str:
+    """Call ``client.judge`` with bounded backoff on transient errors.
+
+    Any exception the client raises (timeout, connection reset, 429, 5xx) is
+    treated as transient and retried up to ``max_attempts`` total, with a short
+    exponential backoff between attempts. The final exception is re-raised so the
+    caller can record a counted failure marker; it is never swallowed.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            return client.judge(rendered, model=model)
+        except Exception as exc:  # noqa: BLE001 - any client error is transient here
+            last_exc = exc
+            if attempt + 1 < max_attempts:
+                time.sleep(backoff_seconds * (2**attempt))
+    # Exhausted every attempt: surface the last error to the caller.
+    assert last_exc is not None
+    raise last_exc
 
 
 def _judge_one(
@@ -290,13 +358,20 @@ def _judge_one(
     dimension: str,
     order: str,
     model: str,
+    *,
+    max_attempts: int = DEFAULT_JUDGE_MAX_ATTEMPTS,
+    backoff_seconds: float = DEFAULT_JUDGE_BACKOFF_SECONDS,
 ) -> JudgeVerdict:
-    """Run one (pair, dimension) comparison with one retry on a malformed reply.
+    """Run one (pair, dimension) comparison, resilient to transient failures.
 
-    Returns a fully-populated :class:`JudgeVerdict`. On a malformed first reply
-    the call is retried exactly once; if the retry is also malformed the verdict
-    is recorded with ``choice="invalid"`` and ``retry_count=1`` (excluded but
-    counted), never silently scored.
+    Returns a fully-populated :class:`JudgeVerdict`. Each judge call is retried
+    with bounded backoff on a transient error. On a malformed (but successful)
+    first reply the call is retried exactly once; if the retry is also malformed
+    the verdict is recorded with ``choice="invalid"`` and ``retry_count=1``
+    (excluded but counted). If the judge keeps *failing* (raising) after all
+    retries, the verdict is likewise recorded as ``choice="invalid"`` with the
+    exception text in ``raw_response`` -- a counted failure marker -- so the run
+    continues and the shortfall is surfaced in aggregation rather than aborting.
     """
     if order == "model_first":
         candidate_a, candidate_b = pair.model_text, pair.human_text
@@ -310,12 +385,46 @@ def _judge_one(
         candidate_b=candidate_b,
     )
 
+    def _failure_verdict(exc: Exception, retry_count: int) -> JudgeVerdict:
+        # Fold a give-up-after-retries into the excluded-and-counted bucket via
+        # the same mechanism as a malformed reply: choice="invalid",
+        # model_won=None, exception text captured for audit in raw_response.
+        return JudgeVerdict(
+            pair_id=pair.pair_id,
+            dimension=dimension,
+            judge_model=model,
+            order=order,
+            raw_response=f"[judge-call-failed] {type(exc).__name__}: {exc}",
+            choice="invalid",
+            retry_count=retry_count,
+            model_won=None,
+        )
+
     retry_count = 0
-    raw_response = client.judge(rendered, model=model)
+    try:
+        raw_response = _call_judge_with_retry(
+            client,
+            rendered,
+            model,
+            max_attempts=max_attempts,
+            backoff_seconds=backoff_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001 - counted failure marker, run continues
+        return _failure_verdict(exc, retry_count)
+
     choice = parse_choice(raw_response)
     if choice == "invalid":
         retry_count = 1
-        raw_response = client.judge(rendered, model=model)
+        try:
+            raw_response = _call_judge_with_retry(
+                client,
+                rendered,
+                model,
+                max_attempts=max_attempts,
+                backoff_seconds=backoff_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 - counted failure marker
+            return _failure_verdict(exc, retry_count)
         choice = parse_choice(raw_response)
 
     return JudgeVerdict(
@@ -340,18 +449,25 @@ def run_judging(
     model: str = DEFAULT_JUDGE_MODEL,
     max_workers: int = 4,
 ) -> list[JudgeVerdict]:
-    """Judge every (pair, dimension), persist all verdicts, and return them.
+    """Judge every (pair, dimension), persisting each verdict as it completes.
 
     One judge call per (pair, dimension) is issued through ``client``,
     concurrency-limited to ``max_workers``. A/B order is assigned per pair from
-    ``seed`` and reused across the six dimensions. Every verdict is written to
-    ``verdicts_path`` as JSONL **before** this function returns and before any
-    scoring, so a crash after this step loses no work: aggregation reads only the
-    persisted file (see :func:`aggregate_verdicts`).
+    ``seed`` and frozen before any worker starts, so it is identical across the
+    six dimensions and reproducible from the seed regardless of scheduling.
 
-    The returned verdicts are ordered deterministically (pair order x
-    :data:`DIMENSION_ORDER`) regardless of the concurrent completion order, so
-    the JSONL is stable across runs with the same inputs and seed.
+    Persistence is incremental and single-writer (FR-008): worker threads compute
+    verdicts concurrently, but exactly one thread (this one, draining
+    :func:`~concurrent.futures.as_completed`) appends each finished verdict to
+    ``verdicts_path`` as soon as it is ready. So a crash, an exception, or a judge
+    that fails partway through leaves *all* completed verdicts durably on disk,
+    and aggregation reads only that file (see :func:`aggregate_verdicts`). Because
+    aggregation groups by pair and dimension, the completion-order line order does
+    not affect the result -- only the frozen A/B order does, keeping the score
+    reproducible.
+
+    The returned list is the same set of verdicts, in completion order (matching
+    the on-disk order).
     """
     if prompts is None:
         prompts = load_judge_prompts()
@@ -360,38 +476,54 @@ def run_judging(
     # independent of scheduling.
     orders = {pair.pair_id: assign_order(pair.pair_id, seed) for pair in pairs}
 
-    # Build the full work list in deterministic order; results are placed back
-    # by index so completion order (concurrency) never affects the output order.
-    tasks: list[tuple[int, JudgePair, str]] = []
+    # Build the full work list. Order here does not affect the result: the
+    # verdict content is fixed by the frozen A/B order, and aggregation groups by
+    # (pair_id, dimension), so completion-order persistence is equivalent.
+    tasks: list[tuple[JudgePair, str]] = []
     for pair in pairs:
         for dimension in DIMENSION_ORDER:
-            tasks.append((len(tasks), pair, dimension))
+            tasks.append((pair, dimension))
 
-    results: list[JudgeVerdict | None] = [None] * len(tasks)
+    path = Path(verdicts_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    def _work(item: tuple[int, JudgePair, str]) -> None:
-        index, pair, dimension = item
-        results[index] = _judge_one(
-            client,
-            prompts,
-            pair,
-            dimension,
-            orders[pair.pair_id],
-            model,
-        )
+    verdicts: list[JudgeVerdict] = []
+    # Single writer: only this thread ever touches the file handle. Workers
+    # compute concurrently and hand completed verdicts back through futures; we
+    # append each one the instant it arrives, so completed work survives a crash.
+    with path.open("w", encoding="utf-8") as fh:
 
-    if tasks:
+        def _persist(verdict: JudgeVerdict) -> None:
+            fh.write(json.dumps(asdict(verdict), ensure_ascii=False))
+            fh.write("\n")
+            fh.flush()  # push each verdict to the OS so a crash keeps it
+            verdicts.append(verdict)
+
+        if not tasks:
+            return verdicts
+
+        def _work(item: tuple[JudgePair, str]) -> JudgeVerdict:
+            pair, dimension = item
+            return _judge_one(
+                client,
+                prompts,
+                pair,
+                dimension,
+                orders[pair.pair_id],
+                model,
+            )
+
         # max_workers must be >= 1 for ThreadPoolExecutor.
         workers = max(1, min(max_workers, len(tasks)))
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            # Drain the iterator so any exception in a worker propagates.
-            list(executor.map(_work, tasks))
+            futures = [executor.submit(_work, item) for item in tasks]
+            for future in as_completed(futures):
+                # .result() re-raises a worker exception. _judge_one already
+                # converts transient judge failures into counted markers, so a
+                # raise here is a genuine bug -- but every verdict persisted
+                # before it is already durably on disk.
+                _persist(future.result())
 
-    verdicts = [v for v in results if v is not None]
-    # Persist BEFORE returning / before any aggregation (FR-008). This is the
-    # durability boundary: once written, JMQ is recomputable from this file
-    # alone without re-querying the judge.
-    write_jsonl(verdicts, verdicts_path)
     return verdicts
 
 

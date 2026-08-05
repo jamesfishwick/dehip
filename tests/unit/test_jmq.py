@@ -64,6 +64,74 @@ class ModelAlwaysWinsJudge:
         return "A" if self._marker in candidate_a else "B"
 
 
+class CountingJudge:
+    """Judge returning a fixed valid reply and counting every call.
+
+    Used to snapshot the judge-call count so a later aggregation can be proven to
+    issue zero additional calls.
+    """
+
+    def __init__(self, reply: str = "A") -> None:
+        self._reply = reply
+        self.calls = 0
+
+    def judge(self, rendered_prompt: str, *, model: str) -> str:
+        self.calls += 1
+        return self._reply
+
+
+class RaisesOnKthCallJudge:
+    """Judge that returns a valid reply until the Kth call, which raises always.
+
+    Models a judge that dies partway through a run. Every call is counted; the
+    Kth and every later call raise a transient-looking error, so with bounded
+    retries that (pair, dimension) ends up a counted failure marker while the
+    verdicts completed before it stay on disk.
+    """
+
+    def __init__(self, fail_from_call: int, reply: str = "A") -> None:
+        self._fail_from_call = fail_from_call
+        self._reply = reply
+        self.calls = 0
+
+    def judge(self, rendered_prompt: str, *, model: str) -> str:
+        self.calls += 1
+        if self.calls >= self._fail_from_call:
+            raise ConnectionError(f"simulated transient failure at call {self.calls}")
+        return self._reply
+
+
+class FlakyThenOkJudge:
+    """Judge that raises for the first ``fail_times`` calls, then returns a reply.
+
+    Exercises the retry path: a transient error that clears on a later attempt
+    must yield a valid verdict, not a failure marker.
+    """
+
+    def __init__(self, fail_times: int, reply: str = "A") -> None:
+        self._remaining_failures = fail_times
+        self._reply = reply
+        self.calls = 0
+
+    def judge(self, rendered_prompt: str, *, model: str) -> str:
+        self.calls += 1
+        if self._remaining_failures > 0:
+            self._remaining_failures -= 1
+            raise TimeoutError("simulated transient timeout")
+        return self._reply
+
+
+class AlwaysRaisesJudge:
+    """Judge whose every call raises a transient-looking error."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def judge(self, rendered_prompt: str, *, model: str) -> str:
+        self.calls += 1
+        raise ConnectionError("simulated persistent transient failure")
+
+
 def _pairs(n: int) -> list[JudgePair]:
     return [
         JudgePair(
@@ -309,6 +377,167 @@ def test_win_rate_reflects_split_outcomes(tmp_path: Path) -> None:
     assert overall["n"] == 40
     assert 0.3 <= overall["win_rate"] <= 0.7
     assert abs(overall["score"] - 2.0 * overall["win_rate"]) < 1e-9
+
+
+# --- Durability: incremental persistence + retry / failure marker ------------
+
+
+@pytest.fixture
+def _no_backoff_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Neutralize retry backoff so failure/retry tests run instantly."""
+    import dehip.metrics.jmq as jmq_mod
+
+    monkeypatch.setattr(jmq_mod.time, "sleep", lambda _seconds: None)
+
+
+def test_completed_verdicts_survive_a_mid_run_judge_failure(
+    tmp_path: Path, _no_backoff_sleep: None
+) -> None:
+    """A judge dying mid-run must not discard the verdicts already computed.
+
+    With single workers the calls are serialized, so the first (K-1) calls
+    succeed and land on disk before the Kth begins failing. The run must COMPLETE
+    (not abort): the failed (pair, dimension) becomes a counted failure marker and
+    aggregation surfaces the shortfall as an ``invalid`` count.
+    """
+    prompts = load_judge_prompts()
+    pairs = _pairs(4)  # 4 pairs x 6 dims = 24 tasks
+    path = tmp_path / "v.jsonl"
+
+    # Succeed on the first 5 calls, then fail on every call from the 6th on. With
+    # bounded retries each failing task consumes several calls, but every task
+    # still resolves to a verdict (valid or counted-failure); the run completes.
+    judge = RaisesOnKthCallJudge(fail_from_call=6, reply="A")
+
+    verdicts = run_judging(
+        pairs,
+        path,
+        client=judge,
+        prompts=prompts,
+        seed=5,
+        max_workers=1,
+    )
+
+    # The run completed: one verdict per (pair, dimension), all persisted.
+    assert len(verdicts) == 4 * len(DIMENSION_ORDER)
+    from_disk = read_jsonl(path, JudgeVerdict)
+    assert len(from_disk) == 4 * len(DIMENSION_ORDER)
+
+    # At least the verdicts completed before the failure are durably on disk and
+    # scored (not lost), and at least one is a counted failure marker.
+    valid = [v for v in from_disk if v.choice != "invalid"]
+    failures = [v for v in from_disk if v.choice == "invalid"]
+    assert valid, "verdicts completed before the failure must survive on disk"
+    assert failures, "the failed calls must be recorded as counted markers"
+    # Failure markers carry the exception text for audit and never score.
+    for v in failures:
+        assert v.model_won is None
+        assert "judge-call-failed" in v.raw_response
+
+    # Aggregation surfaces the shortfall: the total invalid count across
+    # dimensions equals the number of failure markers, and none are scored.
+    scores = aggregate_verdicts(path)
+    total_invalid = sum(scores[d]["invalid"] for d in DIMENSION_ORDER)
+    assert total_invalid == len(failures)
+
+
+def test_transient_failure_then_success_is_retried_to_a_valid_verdict(
+    tmp_path: Path, _no_backoff_sleep: None
+) -> None:
+    """A judge that fails transiently then succeeds yields a valid verdict."""
+    prompts = load_judge_prompts()
+    pair = JudgePair(
+        pair_id="p-flaky",
+        prompt="q",
+        model_text="MODEL_MARKER m",
+        human_text="h",
+    )
+    # Fail once per attempt-sequence, then succeed: within the bounded retries.
+    judge = FlakyThenOkJudge(fail_times=1, reply="A")
+
+    verdicts = run_judging(
+        [pair], tmp_path / "v.jsonl", client=judge, prompts=prompts, seed=1,
+        max_workers=1,
+    )
+
+    assert len(verdicts) == len(DIMENSION_ORDER)
+    # First dimension retried past the single transient failure to a real "A".
+    assert verdicts[0].choice == "A"
+    assert verdicts[0].model_won is not None
+    assert "judge-call-failed" not in verdicts[0].raw_response
+
+
+def test_persistent_failure_yields_counted_marker_and_run_continues(
+    tmp_path: Path, _no_backoff_sleep: None
+) -> None:
+    """A judge that always fails yields counted markers; the run still completes."""
+    prompts = load_judge_prompts()
+    pairs = _pairs(2)
+    path = tmp_path / "v.jsonl"
+    judge = AlwaysRaisesJudge()
+
+    verdicts = run_judging(
+        pairs, path, client=judge, prompts=prompts, seed=1, max_workers=1
+    )
+
+    # Run completed with a verdict per task, all counted failure markers.
+    assert len(verdicts) == 2 * len(DIMENSION_ORDER)
+    assert all(v.choice == "invalid" and v.model_won is None for v in verdicts)
+    # Bounded retries: more than one call per task, but a finite, bounded number.
+    assert judge.calls > len(verdicts)
+
+    scores = aggregate_verdicts(path)
+    for dimension in DIMENSION_ORDER:
+        row = scores[dimension]
+        assert row["invalid"] == 2
+        assert row["n"] == 0
+        assert row["score"] is None
+
+
+# --- Nit: aggregation issues zero judge calls --------------------------------
+
+
+def test_aggregation_issues_zero_judge_calls(tmp_path: Path) -> None:
+    """aggregate_verdicts must read the file only -- never query the judge."""
+    prompts = load_judge_prompts()
+    pairs = _pairs(5)
+    path = tmp_path / "v.jsonl"
+
+    judge = CountingJudge()
+    run_judging(pairs, path, client=judge, prompts=prompts, seed=2, max_workers=1)
+    calls_after_judging = judge.calls
+
+    # Aggregating from the persisted path issues no further judge calls.
+    aggregate_verdicts(path)
+    assert judge.calls == calls_after_judging
+
+
+# --- Nit: deterministic mid-range win-rate known-answer test -----------------
+
+
+def test_known_answer_mid_range_win_rate_and_score() -> None:
+    """Four verdicts (3 model-wins, 1 loss) -> win_rate 0.75, JMQ score 1.5."""
+    verdicts = [
+        JudgeVerdict(
+            pair_id=f"kat-{i}",
+            dimension="overall",
+            judge_model="test",
+            order="model_first",
+            raw_response="A" if model_won else "B",
+            choice="A" if model_won else "B",
+            retry_count=0,
+            model_won=model_won,
+        )
+        for i, model_won in enumerate([True, True, True, False])
+    ]
+
+    scores = aggregate_verdicts(verdicts)
+    row = scores["overall"]
+    assert row["wins"] == 3
+    assert row["losses"] == 1
+    assert row["n"] == 4
+    assert row["win_rate"] == 0.75
+    assert row["score"] == 1.5
 
 
 # --- Cost preflight (FR-009) -------------------------------------------------
