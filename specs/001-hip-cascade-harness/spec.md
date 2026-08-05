@@ -99,7 +99,7 @@ A researcher runs a corpus of prompts through the cascade, scores draft and rewr
 
 ### Measurable Outcomes
 
-- **SC-001**: The harness self-check (human vs human) produces distribution distance and word-frequency distance within documented noise bounds of zero and a judge win-rate between 45% and 55%, on every run.
+- **SC-001**: The harness self-check (human vs human) produces distribution distance and word-frequency distance within documented noise bounds of zero and a judge win-rate inside a binomial acceptance window centered on 50% that scales with the number of valid comparisons n (0.5 +/- 3 * sqrt(0.25/n)), on every run. The window is 45% to 55% at the judged tier (half-size n around 200) and widens at the smoke tier (n around 25). A fixed 45% to 55% band is narrower than one binomial standard deviation at n equals 25, so a fair judge would fall outside it on roughly 69% of runs. See src/dehip/metrics/bounds.py for the derivation and the recorded per-run window.
 - **SC-002**: Given prepared text sets, a researcher obtains a complete three-metric report from a single invocation with no manual intermediate steps.
 - **SC-003**: On a corpus of at least 50 prompts, the cascade's final rewrites score closer to the human reference than the unrewritten drafts on at least two of the three metrics.
 - **SC-004**: At the chosen round count, rewrites preserve the draft's meaning: no more than 5% of bundles are flagged for degeneration, and spot-read checks confirm the rewrite still answers the original prompt.
