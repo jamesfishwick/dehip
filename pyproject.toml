@@ -10,6 +10,7 @@ dependencies = [
     "openai",
     "numpy",
     "scipy",
+    "pyarrow",
 ]
 
 [project.scripts]
