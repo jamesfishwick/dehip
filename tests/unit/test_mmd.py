@@ -9,6 +9,7 @@ from dehip.metrics.mmd import (
     MMDResult,
     median_heuristic_bandwidth,
     mmd2_unbiased,
+    rbf_gram,
 )
 
 
@@ -228,3 +229,108 @@ def test_rejects_nonpositive_bandwidth():
     y = np.ones((3, 2))
     with pytest.raises(ValueError, match="bandwidth must be positive"):
         mmd2_unbiased(x, y, bandwidth=0.0)
+
+
+# --- Bandwidth known-answer (oracle) tests -----------------------------------
+
+
+def test_bandwidth_oracle_odd_count():
+    """Pooled [0, 1, 3] -> off-diagonal sq dists {1, 9, 4}, median 4, sigma 2.
+
+    x = [0], y = [1, 3] so the pool is [0, 1, 3]. Off-diagonal squared
+    distances are (0,1)->1, (0,3)->9, (1,3)->4; their median is 4 and the
+    bandwidth is sqrt(4) == 2.0.
+    """
+    x = np.array([[0.0]])
+    y = np.array([[1.0], [3.0]])
+    assert median_heuristic_bandwidth(x, y) == pytest.approx(2.0, abs=1e-12)
+
+
+def test_bandwidth_oracle_even_count_averages_two_middle():
+    """Even pool: the median averages the two middle off-diagonal distances.
+
+    Pool [0, 1, 4, 6] (x = [0, 1], y = [4, 6]). Off-diagonal squared distances:
+      (0,1)=1, (0,4)=16, (0,6)=36, (1,4)=9, (1,6)=25, (4,6)=4.
+    Sorted: [1, 4, 9, 16, 25, 36]; the two middle values are 9 and 16, so the
+    median is 12.5 and sigma == sqrt(12.5).
+
+    This fixture is mutation-sensitive: a triu k=1 -> k=0 change would readmit
+    the six zero self-distances, shifting the sorted array and its median, so
+    the asserted value would no longer hold.
+    """
+    x = np.array([[0.0], [1.0]])
+    y = np.array([[4.0], [6.0]])
+    assert median_heuristic_bandwidth(x, y) == pytest.approx(
+        math.sqrt(12.5), abs=1e-12
+    )
+
+
+def test_bandwidth_duplicate_heavy_returns_positive_without_raising():
+    """More than half the pairs coincide -> positive bandwidth, no raise.
+
+    Six copies of [0.0] and two of [1.0]: most off-diagonal pairs are identical
+    (distance 0), so the plain median is 0, but nonzero distances exist. The
+    function must fall back to the nonzero median (here every nonzero squared
+    distance is 1) and return a positive bandwidth rather than aborting.
+    """
+    x = np.array([[0.0], [0.0], [0.0], [0.0], [0.0], [0.0]])
+    y = np.array([[1.0], [1.0]])
+    bw = median_heuristic_bandwidth(x, y)
+    assert bw > 0.0
+    assert bw == pytest.approx(1.0, abs=1e-12)
+
+
+def test_bandwidth_all_coincident_raises():
+    """A pool whose every point coincides is genuinely degenerate."""
+    x = np.zeros((3, 2))
+    y = np.zeros((2, 2))
+    with pytest.raises(ValueError, match="all points coincident"):
+        median_heuristic_bandwidth(x, y)
+
+
+# --- Non-finite input rejection ----------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf])
+def test_rejects_non_finite_in_x(bad):
+    x = np.array([[0.0], [bad]])
+    y = np.array([[1.0], [2.0]])
+    with pytest.raises(ValueError, match="x contains non-finite"):
+        mmd2_unbiased(x, y)
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf])
+def test_rejects_non_finite_in_y(bad):
+    x = np.array([[0.0], [1.0]])
+    y = np.array([[1.0], [bad]])
+    with pytest.raises(ValueError, match="y contains non-finite"):
+        mmd2_unbiased(x, y)
+
+
+# --- rbf_gram direct known-value + validation --------------------------------
+
+
+def test_rbf_gram_known_values():
+    """exp(-||a_i - b_j||^2 / (2 sigma^2)) for a hand-checked 2x2 case.
+
+    a = [0, 1], b = [0, 2], sigma = 1. Squared distances:
+      (0,0)=0 -> exp(0)=1 ; (0,2)=4 -> exp(-2)
+      (1,0)=1 -> exp(-0.5); (1,2)=1 -> exp(-0.5)
+    """
+    a = np.array([[0.0], [1.0]])
+    b = np.array([[0.0], [2.0]])
+    gram = rbf_gram(a, b, bandwidth=1.0)
+    expected = np.array(
+        [
+            [1.0, math.exp(-2.0)],
+            [math.exp(-0.5), math.exp(-0.5)],
+        ]
+    )
+    assert np.allclose(gram, expected, atol=1e-12)
+
+
+def test_rbf_gram_rejects_non_finite():
+    a = np.array([[0.0], [np.inf]])
+    b = np.array([[1.0], [2.0]])
+    with pytest.raises(ValueError, match="a contains non-finite"):
+        rbf_gram(a, b, bandwidth=1.0)

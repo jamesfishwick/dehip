@@ -40,6 +40,8 @@ def _as_2d(name: str, x: np.ndarray) -> np.ndarray:
         raise ValueError(f"{name} must be a 2D array (n x d), got shape {x.shape}")
     if x.shape[0] < 1:
         raise ValueError(f"{name} must have at least one row")
+    if not np.isfinite(x).all():
+        raise ValueError(f"{name} contains non-finite values (NaN or inf)")
     return x
 
 
@@ -59,6 +61,13 @@ def median_heuristic_bandwidth(x: np.ndarray, y: np.ndarray) -> float:
     The bandwidth (sigma) is the square root of the median of the squared
     pairwise Euclidean distances across all points in ``x`` and ``y`` pooled
     together, excluding each point's zero self-distance.
+
+    When more than half the off-diagonal pairs coincide (a duplicate-heavy but
+    valid pool, realistic for HIP paraphrase outputs) the plain median is zero,
+    yet a positive bandwidth still exists. In that case we fall back to the
+    median of the *nonzero* squared distances so a computable MMD is not falsely
+    aborted. Only a pool whose off-diagonal distances are *all* zero (every
+    point coincident) is genuinely degenerate and raises.
 
     Raises:
         ValueError: if the pooled sample has fewer than two distinct points, so
@@ -81,10 +90,17 @@ def median_heuristic_bandwidth(x: np.ndarray, y: np.ndarray) -> float:
 
     median_sq = float(np.median(off_diagonal))
     if median_sq <= 0.0:
-        raise ValueError(
-            "median pairwise distance is zero; pooled sample is degenerate "
-            "(all points coincident), so no positive bandwidth exists"
-        )
+        # A zero median means more than half the pairs coincide, not that the
+        # pool is degenerate. Fall back to the median of the nonzero squared
+        # distances; only an all-zero pool (every point coincident) has no
+        # positive bandwidth and is the genuine degenerate case.
+        nonzero = off_diagonal[off_diagonal > 0.0]
+        if nonzero.size == 0:
+            raise ValueError(
+                "all pairwise distances are zero; pooled sample is degenerate "
+                "(all points coincident), so no positive bandwidth exists"
+            )
+        median_sq = float(np.median(nonzero))
     return float(np.sqrt(median_sq))
 
 
@@ -92,6 +108,10 @@ def rbf_gram(a: np.ndarray, b: np.ndarray, bandwidth: float) -> np.ndarray:
     """Gaussian RBF kernel matrix: exp(-||a_i - b_j||^2 / (2 * sigma^2))."""
     if bandwidth <= 0.0:
         raise ValueError(f"bandwidth must be positive, got {bandwidth}")
+    # Validate inputs here too so a direct caller (rbf_gram is public) gets the
+    # same finite/shape guarding as the top-level MMD entry points.
+    a = _as_2d("a", a)
+    b = _as_2d("b", b)
     sq = _pairwise_sq_dists(a, b)
     return np.exp(-sq / (2.0 * bandwidth * bandwidth))
 
