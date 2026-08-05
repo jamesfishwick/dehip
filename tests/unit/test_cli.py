@@ -34,12 +34,13 @@ VALID_INVOCATIONS = {
 
 ALL_COMMANDS = sorted(cli.COMMANDS)
 
-# Commands still served by the shared stub. ``score`` became a real command in
-# issue #10, so its handler no longer emits the {"status": "stub"} summary and
-# is excluded from the stub-shape assertions below (its behavior is covered by
-# test_score_cli.py). Every other command remains a stub until its own ticket.
-STUB_COMMANDS = sorted(set(cli.COMMANDS) - {"score"})
-
+# Commands still served by the shared stub. ``build-corpus`` (issue #5) and
+# ``score`` (issue #10) became real commands, so their handlers no longer emit
+# the {"status": "stub"} summary and are excluded from the stub-shape assertions
+# below (their behavior is covered by test_corpus.py and test_score_cli.py).
+# Flag-rejection (argparse, pre-handler) still covers every command. The rest
+# remain stubs until their own tickets.
+STUB_COMMANDS = sorted(set(cli.COMMANDS) - {"build-corpus", "score"})
 
 def _run_cli(argv):
     """Run the CLI as a subprocess so stdout/stderr are cleanly separated."""
@@ -102,7 +103,8 @@ def test_seed_appears_in_summary(command):
 
 
 def test_default_seed_recorded():
-    summary = _run_json(["build-corpus"])
+    # build-corpus is no longer a stub (issue #5); use a remaining stub command.
+    summary = _run_json(["rewrite"])
     assert summary["seed"] == 0
 
 
