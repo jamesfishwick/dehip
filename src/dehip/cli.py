@@ -278,9 +278,10 @@ def _run_full_score(args: argparse.Namespace, report_mod, Path) -> int:
         _progress(f"dehip score: external dependency failed: {exc}")
         return EXIT_EXTERNAL_DEP
 
-    # Verdicts live in the run directory alongside the report, matching
-    # data-model's results/runs/{run_id}/verdicts.jsonl and the documented
-    # --recompute-jmq-from example (NIT 1): <out-dir>/verdicts.jsonl.
+    # Verdicts live beside the report at <out-dir>/verdicts.jsonl, matching the
+    # documented --recompute-jmq-from example. `score` has no run_id concept; the
+    # results/runs/{run_id}/ layout in data-model belongs to the rewrite/run
+    # pipeline (a later ticket), not this command.
     verdicts_path = None
     if "jmq" in selected:
         if args.out:
@@ -314,7 +315,10 @@ def _run_full_score(args: argparse.Namespace, report_mod, Path) -> int:
         return EXIT_EXTERNAL_DEP
     except (ValueError, KeyError) as exc:
         # Input/data-class seams: unknown metric, id mismatch surfacing as a
-        # KeyError, MMD median-heuristic on all-coincident points -> exit 2.
+        # KeyError, MMD median-heuristic on all-coincident points -> exit 2. The
+        # classification is by exception TYPE (data-class errors, not external
+        # deps), deliberately broad so a real input error reports exit 2 rather
+        # than escaping as a bare exit-1 traceback.
         _progress(f"dehip score: input error: {exc}")
         return EXIT_VALIDATION
 
@@ -322,50 +326,74 @@ def _run_full_score(args: argparse.Namespace, report_mod, Path) -> int:
 
 
 def _emit_report(report, out_path, report_mod) -> int:
-    """Write the report JSON (and a sibling .md) and echo the JSON to stdout.
+    """Write the report JSON and a sibling .md as an all-or-nothing pair, echo JSON.
 
     The on-disk JSON and the stdout echo both go through
     :func:`~dehip.report.report_to_jsonable`, which converts an un-run metric's
     ``NaN`` to strict-JSON ``null`` (IMPORTANT 1) while leaving a real ``0.0``.
-    The file write is atomic (temp file + ``os.replace``, IMPORTANT 4); any I/O
-    failure is caught and mapped to EXIT_IO with the path and artifact named,
-    rather than leaving a half-written file and a bare exit-1 traceback. Returns
-    the process exit code.
+
+    The two artifacts are written as one atomic pair (NIT 3): both are staged to
+    temp files in their target dir first, and only after BOTH temp writes succeed
+    are they ``os.replace``d into place. A failure on either write leaves NEITHER
+    final artifact (no orphaned ``.json`` with a missing ``.md``) and removes any
+    temp debris. Any I/O failure maps to EXIT_IO with the path and artifact named,
+    rather than a half-written pair and a bare exit-1 traceback. Returns the
+    process exit code.
     """
     from pathlib import Path
 
     jsonable = report_mod.report_to_jsonable(report)
 
     if out_path:
+        json_path = Path(out_path)
+        md_path = json_path.with_suffix(".md")
+        staged: list[tuple[Path, Path]] = []  # (tmp, final) pairs to commit
         try:
-            _atomic_write_text(
-                Path(out_path),
-                json.dumps(jsonable, ensure_ascii=False, indent=2) + "\n",
+            # Stage BOTH artifacts to temp files before committing either, so a
+            # failure while rendering/writing the .md cannot leave a lone .json.
+            staged.append(
+                (
+                    _stage_text(
+                        json_path,
+                        json.dumps(jsonable, ensure_ascii=False, indent=2) + "\n",
+                    ),
+                    json_path,
+                )
+            )
+            staged.append(
+                (_stage_text(md_path, report_mod.render_markdown(report)), md_path)
             )
         except OSError as exc:
-            _progress(f"dehip score: failed to write report json {out_path}: {exc}")
+            # Clean up any temp already staged; commit nothing.
+            _discard_staged(staged)
+            failed = md_path if staged else json_path
+            _progress(f"dehip score: failed to write report {failed}: {exc}")
             return EXIT_IO
-        md_path = Path(out_path).with_suffix(".md")
+
+        # Both temps written: commit them. os.replace is atomic per file; if the
+        # second replace somehow fails, the discard drops the second temp (the
+        # first is already committed, matching per-file atomicity).
         try:
-            _atomic_write_text(md_path, report_mod.render_markdown(report))
+            _commit_staged(staged)
         except OSError as exc:
-            _progress(f"dehip score: failed to write report md {md_path}: {exc}")
+            _discard_staged(staged)
+            _progress(f"dehip score: failed to finalize report {out_path}: {exc}")
             return EXIT_IO
-        _progress(f"dehip score: wrote {out_path} and {md_path}")
+        _progress(f"dehip score: wrote {json_path} and {md_path}")
 
     json.dump(jsonable, sys.stdout)
     sys.stdout.write("\n")
     return EXIT_SUCCESS
 
 
-def _atomic_write_text(path, text: str) -> None:
-    """Write ``text`` to ``path`` atomically: temp file in the same dir, then replace.
+def _stage_text(path, text: str):
+    """Write ``text`` to a temp file beside ``path``; return the temp Path.
 
-    Mirrors the embedding cache's approach (temp file + ``os.replace``, which is
-    atomic on one filesystem): a reader never sees a partially-written report,
-    and a mid-write failure leaves the previous file (if any) intact rather than
-    a truncated one. Raises ``OSError`` on any failure (unwritable dir, full
-    disk) so the caller can map it to a clear exit code.
+    Ensures the target directory exists and writes the content to a sibling temp
+    file, but does NOT replace ``path`` -- that is the commit step. Raises
+    ``OSError`` on any failure (unwritable dir, full disk) with the temp file
+    already removed, so a caller can stage several artifacts and only commit once
+    all of them are on disk.
     """
     import os
     from pathlib import Path
@@ -375,14 +403,36 @@ def _atomic_write_text(path, text: str) -> None:
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
         tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
     except OSError:
-        # Clean up the partial temp file; never leave debris on a failed write.
         try:
             tmp.unlink()
         except OSError:
             pass
         raise
+    return tmp
+
+
+def _commit_staged(staged) -> None:
+    """``os.replace`` each staged ``(tmp, final)`` pair into place.
+
+    ``os.replace`` is atomic on one filesystem, so a reader never sees a
+    partially-written artifact. Called only after every temp is confirmed on
+    disk, so the common failure (render/write of the second artifact) has already
+    been ruled out before any final file is touched.
+    """
+    import os
+
+    for tmp, final in staged:
+        os.replace(tmp, final)
+
+
+def _discard_staged(staged) -> None:
+    """Remove any staged temp files; never leave debris on a failed write."""
+    for tmp, _final in staged:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 def _add_score(subparsers: argparse._SubParsersAction) -> None:

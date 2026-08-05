@@ -377,6 +377,48 @@ def test_cli_unwritable_report_path_exits_io(tmp_path, monkeypatch):
     assert not out.exists()
 
 
+def test_cli_md_write_failure_leaves_neither_artifact(tmp_path, monkeypatch):
+    """NIT 3: when the .md render/write fails, NEITHER final .json nor .md exists.
+
+    The two artifacts are an all-or-nothing pair: both are staged to temp files
+    before either is committed, so a failure while producing the .md must leave
+    no orphaned .json (and no .md). Also asserts exit EXIT_IO and that no .tmp
+    debris survives in the output dir.
+
+    Failure is injected by making render_markdown raise OSError, so the .json has
+    already been staged to a temp when the .md stage fails -- the exact "json
+    succeeds, md fails" ordering this fix protects.
+    """
+    cand, ref, _ = _corpus(tmp_path, 4)
+    _patch_seams(monkeypatch)
+
+    def _boom(_report):
+        raise OSError("simulated md render failure")
+
+    monkeypatch.setattr(report_mod, "render_markdown", _boom)
+
+    out = tmp_path / "report.json"
+    rc = cli.main(
+        [
+            "score",
+            "--candidate",
+            cand,
+            "--reference",
+            ref,
+            "--metrics",
+            "token_l2",
+            "--out",
+            str(out),
+        ]
+    )
+    assert rc == cli.EXIT_IO
+    # All-or-nothing: neither final artifact exists.
+    assert not out.exists()
+    assert not out.with_suffix(".md").exists()
+    # No temp debris left behind anywhere in the output dir.
+    assert not list(tmp_path.glob("*.tmp"))
+
+
 # --- Recompute path: zero judge calls, through CLI dispatch ------------------
 
 
@@ -524,6 +566,115 @@ def test_cli_texts_superset_of_manifest_not_scored(tmp_path, monkeypatch):
     assert rc == cli.EXIT_VALIDATION
     assert embedder.call_count == 0
     assert judge.calls == 0
+
+
+def _write_prompts(tmp_path, prompt_ids):
+    """Write a {pair_id, prompt} JSONL for the given ids; return its path str."""
+    path = tmp_path / "prompts.jsonl"
+    with path.open("w", encoding="utf-8") as fh:
+        for i, pid in enumerate(prompt_ids):
+            fh.write(json.dumps({"pair_id": pid, "prompt": f"prompt {i}"}) + "\n")
+    return str(path)
+
+
+def test_cli_prompts_superset_exits_validation_no_spend(tmp_path, monkeypatch):
+    """A prompts JSONL that is a SUPERSET of the pair set -> exit 2, no spend.
+
+    The manifests name 4 ids; the prompts file carries a 5th (an extra prompt
+    id). Because JMQ's spend depends on prompts, a stray prompt id must be
+    rejected at load time with exit 2 (like the texts superset gate), not
+    silently ignored while the run proceeds and pays for judging. Asserts zero
+    judge calls and no report written.
+    """
+    cand, ref, _ = _corpus(tmp_path, 4)
+    pair_ids = [f"fineweb-{i}" for i in range(4)]
+    prompts = _write_prompts(tmp_path, pair_ids + ["fineweb-99"])  # superset
+
+    embedder, judge = _patch_seams(monkeypatch)
+    out = tmp_path / "r.json"
+    rc = cli.main(
+        [
+            "score",
+            "--candidate",
+            cand,
+            "--reference",
+            ref,
+            "--prompts",
+            prompts,
+            "--metrics",
+            "jmq",
+            "--out",
+            str(out),
+            "--yes",
+        ]
+    )
+    assert rc == cli.EXIT_VALIDATION
+    assert judge.calls == 0  # rejected before any judge spend
+    assert embedder.call_count == 0
+    assert not out.exists()  # no report written
+
+
+def test_cli_prompts_subset_exits_validation_not_keyerror(tmp_path, monkeypatch):
+    """A prompts JSONL that is a SUBSET of the pair set -> exit 2, not a late KeyError.
+
+    The manifests name 4 ids; the prompts file covers only 3 (a missing prompt
+    id). This must fail as exit-2 input validation at load time, not surface late
+    as a KeyError inside _judge_pairs. Asserts zero judge calls and no report.
+    """
+    cand, ref, _ = _corpus(tmp_path, 4)
+    pair_ids = [f"fineweb-{i}" for i in range(4)]
+    prompts = _write_prompts(tmp_path, pair_ids[:3])  # subset (missing fineweb-3)
+
+    embedder, judge = _patch_seams(monkeypatch)
+    out = tmp_path / "r.json"
+    rc = cli.main(
+        [
+            "score",
+            "--candidate",
+            cand,
+            "--reference",
+            ref,
+            "--prompts",
+            prompts,
+            "--metrics",
+            "jmq",
+            "--out",
+            str(out),
+            "--yes",
+        ]
+    )
+    assert rc == cli.EXIT_VALIDATION
+    assert judge.calls == 0
+    assert not out.exists()
+
+
+def test_cli_token_l2_no_prompts_still_succeeds(tmp_path, monkeypatch):
+    """False-positive guard: a --metrics token_l2 run with NO --prompts succeeds.
+
+    The prompts exact-set gate must fire ONLY when a prompts file is passed. A
+    metrics subset that omits JMQ and passes no prompts must NOT start failing
+    validation just because the prompts check exists.
+    """
+    cand, ref, _ = _corpus(tmp_path, 4)
+    _patch_seams(monkeypatch)
+    out = tmp_path / "ok.json"
+    rc = cli.main(
+        [
+            "score",
+            "--candidate",
+            cand,
+            "--reference",
+            ref,
+            "--metrics",
+            "token_l2",
+            "--out",
+            str(out),
+            # no --prompts
+        ]
+    )
+    assert rc == cli.EXIT_SUCCESS
+    written = json.loads(out.read_text())
+    assert not np.isnan(written["token_l2"])
 
 
 def test_cli_missing_input_exits_validation(tmp_path, monkeypatch):

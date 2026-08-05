@@ -58,8 +58,8 @@ dehip score --candidate {set manifest} --reference {set manifest}
 ```
 
 - Validation before spend: pairing, counts, min lengths, min N; JMQ cost preflight with `--yes` gate.
-- Output: MetricReport JSON + rendered .md; verdicts JSONL persisted before aggregation.
-- `--recompute-jmq-from results/runs/{run_id}/verdicts.jsonl` re-aggregates without API calls (FR-008).
+- Output: MetricReport JSON + rendered .md; JMQ verdicts persisted before aggregation beside the report at `<out-dir>/verdicts.jsonl` (the directory of `--out`). `score` has no run_id concept; the `results/runs/{run_id}/` layout belongs to the rewrite/run pipeline (a later ticket).
+- `--recompute-jmq-from <out-dir>/verdicts.jsonl` re-aggregates without API calls (FR-008).
 
 ## dehip self-check
 

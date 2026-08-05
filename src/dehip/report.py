@@ -184,6 +184,13 @@ def load_scoring_inputs(
     :class:`~dehip.validate.InputSetValidationError` (exit 2) *before* any
     embedder or judge is touched -- never surfacing later as a KeyError.
 
+    When a ``prompts_path`` is given (JMQ requested), the prompt ids get the same
+    exact-set gate: they must equal the pair ids. A prompts file that is a
+    superset (stray prompt id) or subset (missing prompt id) is rejected here at
+    exit 2 before any spend, rather than the superset being silently ignored or
+    the subset failing late as a KeyError. When no prompts file is passed (a
+    metrics subset that omits JMQ), no prompt check runs.
+
     Returns the inputs plus the two ``set_id`` strings for the report identity.
     """
     from dehip.schemas import TextSet, read_json
@@ -225,6 +232,15 @@ def load_scoring_inputs(
                     continue
                 record = json.loads(line)
                 prompts[record["pair_id"]] = record["prompt"]
+        # Prompts are a JMQ input the judge spend depends on, so they get the same
+        # exact-set gate as the texts files: the prompt ids must equal the pair
+        # ids, not merely cover them. A superset (an extra prompt id) is caught
+        # here rather than silently ignored; a subset (a missing prompt id) is
+        # caught here as exit-2 validation rather than late as a KeyError inside
+        # _judge_pairs. The check runs only when a prompts file was passed, so a
+        # metrics-subset run with no prompts (e.g. --metrics token_l2) is
+        # untouched and cannot false-positive.
+        _assert_ids_match("pair_ids", cand_ids, "prompts", prompts.keys())
 
     return (
         MetricInputs(
