@@ -204,6 +204,9 @@ class EmbeddingCache:
         self._vectors: list[np.ndarray] = []
         self._rows: list[tuple[str, str]] = []
         self._dims: dict[str, int] = {}
+        # Whether we have verified the live embedder's output dim against the
+        # cached dim for this session. See ``_verify_live_dim_once``.
+        self._live_dim_verified = False
         self._load()
 
     def _integrity_error(self, detail: str) -> CacheIntegrityError:
@@ -299,15 +302,52 @@ class EmbeddingCache:
                 f"{dim}. Bump the embedder_id or clear the cache"
             )
 
+    def _verify_live_dim_once(self) -> None:
+        """Probe the live embedder's output dim and compare it to the cache.
+
+        Runs at most once per instance, on the first serve of any kind (``get``,
+        ``embed``, ``embed_one``). It closes the ALL-HITS drift hole: if the model
+        behind an unchanged ``embedder_id`` changes its output width, a warm cache
+        whose requested texts are all hits would otherwise serve OLD-width vectors
+        with zero embed calls and no check. So when the cache already records a dim
+        for this embedder_id, we embed one probe text purely to learn the live
+        width and hand it to ``_check_live_dim``, which raises on mismatch. The one
+        extra embed call on the warm path is an accepted correctness cost.
+
+        Limitation: this catches only *dimension* drift. A same-dimension model
+        swap (e.g. a fine-tune that keeps the output width) is undetectable without
+        a model-provided identity fingerprint the Embedder protocol does not carry;
+        that is a known gap, not something this probe attempts to solve.
+        """
+        if self._live_dim_verified:
+            return
+        # Only worth probing when there is a cached dim to compare against. With no
+        # cached dim, the first real embed establishes it via the miss path.
+        cached = self._dims.get(self._embedder_id)
+        if cached is None:
+            self._live_dim_verified = True
+            return
+        probe = self._embed_fn(["\x00dehip-dim-probe\x00"])
+        if probe.ndim != 2 or probe.shape[0] < 1:
+            raise ValueError(
+                f"embed_fn must return a 2-D array with at least one row for the "
+                f"dim probe; got shape {probe.shape!r}"
+            )
+        self._check_live_dim(int(probe.shape[1]))
+        self._live_dim_verified = True
+
     def _flush(self) -> None:
         """Atomically persist the store and index (store first, then index).
 
         Each artifact is written to a uniquely-named temp file in ``cache_dir``
         and ``os.replace``'d into place, which is atomic on the same filesystem.
         The store is replaced before the index, so the index a reader sees never
-        references a store row that is not yet on disk; a crash between the two
-        replaces leaves the previous (consistent) index in place and cannot
-        expose a half-written orphan.
+        references a store row that is not yet on disk (no half-written orphan
+        ref). A crash *between* the two replaces leaves the store advanced but the
+        index stale, an inconsistent on-disk pair; the guarantee is not that this
+        window is impossible but that the loader detects the row-count desync and
+        raises ``CacheIntegrityError`` on the next reopen rather than serving a
+        mismatched cache.
         """
         store = (
             np.stack(self._vectors, axis=0)
@@ -362,6 +402,7 @@ class EmbeddingCache:
 
     def get(self, text: str) -> np.ndarray | None:
         """Return the cached vector for ``text`` under this embedder, or None."""
+        self._verify_live_dim_once()
         sha = content_sha256(text)
         ref = self._index.get((self._embedder_id, sha))
         if ref is None:
@@ -379,6 +420,10 @@ class EmbeddingCache:
         texts = list(texts)
         if not texts:
             return np.empty((0, 0), dtype=_STORE_DTYPE)
+
+        # Verify the live dim before serving ANY hit, so an all-hits warm cache
+        # under a drifted model raises instead of returning stale-width vectors.
+        self._verify_live_dim_once()
 
         shas = [content_sha256(t) for t in texts]
 

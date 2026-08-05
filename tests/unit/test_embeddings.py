@@ -87,12 +87,21 @@ def test_cache_persists_across_fresh_instantiation(tmp_path):
     assert stub1.calls == 1
 
     # A brand-new cache object over the same dir, with a fresh stub whose call
-    # counter starts at zero. The read must come from disk, not the stub.
+    # counter starts at zero. The requested text must come from disk, not the
+    # stub. The stub is invoked exactly once, for the one-time live-dim probe
+    # that guards against a drifted model serving stale-width hits (an accepted
+    # correctness cost on the warm path); the probe text is NOT "persist me".
     stub2 = StubEmbedder()
     cache2 = EmbeddingCache(stub2, cache_dir=cache_dir)
     reloaded = cache2.embed_one("persist me")
-    assert stub2.calls == 0
+    assert stub2.calls == 1  # the dim probe only; "persist me" was a cache hit
     np.testing.assert_array_equal(original, reloaded)
+
+    # A second serve on the same instance does NOT re-probe: the live dim is
+    # verified once per instance, so this hit adds zero further calls.
+    again = cache2.embed_one("persist me")
+    assert stub2.calls == 1
+    np.testing.assert_array_equal(original, again)
 
 
 def test_batch_path_matches_single_text_path(tmp_path):
@@ -127,11 +136,14 @@ def test_same_text_different_embedder_is_distinct_entry(tmp_path):
     assert content_sha256("shared text") == content_sha256("shared text")
     assert not np.array_equal(vec_a, vec_b)
 
-    # Embedder A's entry still resolves from cache without recompute.
+    # Embedder A's entry still resolves from cache without recomputing the
+    # requested text. The one call is the one-time live-dim probe on a warm
+    # reopen (see test_cache_persists_across_fresh_instantiation), not a recompute
+    # of "shared text", which is served from disk.
     stub_a2 = StubEmbedder(embedder_id="embedder-A")
     cache_a2 = EmbeddingCache(stub_a2, cache_dir=cache_dir)
     np.testing.assert_array_equal(vec_a, cache_a2.embed_one("shared text"))
-    assert stub_a2.calls == 0
+    assert stub_a2.calls == 1  # dim probe only
 
 
 # --- Integrity / hardening tests (Korgull findings) -----------------------
@@ -176,6 +188,37 @@ def test_changed_output_dim_same_embedder_id_raises(tmp_path):
     reopened = EmbeddingCache(drifted, cache_dir=cache_dir)
     with pytest.raises(CacheIntegrityError):
         reopened.embed_one("new text")
+
+
+def test_all_hits_drift_raises_before_serving_stale_vectors(tmp_path):
+    """Re-review IMPORTANT: dim drift must be caught even on an ALL-HITS path.
+
+    ``_check_live_dim`` used to run only after misses were computed, so a warm
+    cache whose requested texts are all hits, under a model that changed output
+    dim but kept the embedder_id, would serve OLD-width vectors with ZERO embed
+    calls and no raise. This is the same stale-vector failure as the miss-path
+    test, on the most common path (re-scoring an unchanged corpus after a model
+    swap). Build a dim-8 cache, reopen with a dim-16 stub under the same id, and
+    request ONLY already-cached text: it must RAISE, not return a dim-8 vector.
+    """
+    cache_dir = tmp_path / "emb-cache"
+    warm = EmbeddingCache(StubEmbedder(dim=8), cache_dir=cache_dir)
+    warm.embed_one("cached text")  # populate a dim-8 entry
+
+    drifted = StubEmbedder(embedder_id="stub-embedder-v1", dim=16)
+    reopened = EmbeddingCache(drifted, cache_dir=cache_dir)
+
+    with pytest.raises(CacheIntegrityError):
+        # ONLY an already-cached text: an all-hits request, no miss to trigger
+        # the old miss-path check.
+        reopened.embed_one("cached text")
+
+    # get() is the other serve path and must guard identically.
+    reopened_get = EmbeddingCache(
+        StubEmbedder(embedder_id="stub-embedder-v1", dim=16), cache_dir=cache_dir
+    )
+    with pytest.raises(CacheIntegrityError):
+        reopened_get.get("cached text")
 
 
 def test_desynced_store_fewer_rows_than_index_raises(tmp_path):
