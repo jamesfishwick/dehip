@@ -32,4 +32,5 @@ packages = ["src/dehip"]
 select = ["E", "F", "I", "W", "UP", "B"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests/unit", "tests/integration"]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"
