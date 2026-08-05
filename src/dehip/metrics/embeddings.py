@@ -24,6 +24,12 @@ crash mid-flush can never leave a visible half-written cache. Any detected
 corruption or desync raises ``CacheIntegrityError`` naming the ``cache_dir`` and
 the recovery step (clear that directory), rather than degrading into an opaque
 ``IndexError`` or silently re-embedding over the damage.
+
+The vector store is one dense array, so each ``cache_dir`` holds a single output
+dimension across every ``embedder_id`` sharing it. Two embedders with different
+output dims cannot share a dir; an append of a mismatched width raises
+``CacheIntegrityError`` (naming both dims) instead of a raw ``np.stack``
+``ValueError``. Use a separate ``cache_dir`` per output dimension.
 """
 
 from __future__ import annotations
@@ -166,6 +172,17 @@ class EmbeddingCache:
     ``embedder_id`` are stored aligned with each store row, so every read can
     confirm the row it returns belongs to the requested key, and the loader can
     detect a store/index desync before it becomes an opaque ``IndexError``.
+
+    One output dimension per cache_dir
+    ----------------------------------
+    The vector store is a single dense array (``np.stack`` in ``_flush``), so a
+    given ``cache_dir`` holds exactly one output dimension across every
+    ``embedder_id`` that shares it. Multiple ``embedder_id``s may coexist in one
+    dir only if they emit the SAME dim; two embedders with different output dims
+    cannot. An append whose width differs from the store's existing rows raises
+    ``CacheIntegrityError`` (see ``_check_store_dim``) naming both dims and the
+    fix (a separate ``cache_dir`` per output dimension, or clear this one) rather
+    than dying with a raw ``ValueError`` from ``np.stack``.
     """
 
     _INDEX_SCHEMA = pa.schema(
@@ -302,6 +319,33 @@ class EmbeddingCache:
                 f"{dim}. Bump the embedder_id or clear the cache"
             )
 
+    def _check_store_dim(self, dim: int) -> None:
+        """Reject a vector whose width differs from any row already in the store.
+
+        The vector store is a single dense array (``np.stack`` in ``_flush``), so
+        it can only hold one output dimension for the whole ``cache_dir``, across
+        all ``embedder_id``s that share it. That is narrower than the key space,
+        which admits multiple ``embedder_id``s: two embedders with DIFFERENT
+        output dims cannot coexist in one store. Without this guard the second
+        embedder's first append would reach ``np.stack`` on a ragged list and die
+        with a raw ``ValueError: all input arrays must have the same shape``.
+
+        Catch it here, before any in-memory mutation, and raise a
+        ``CacheIntegrityError`` naming both dims and the fix. ``_check_live_dim``
+        only covers same-``embedder_id`` drift; this covers the cross-embedder
+        case an unchanged ``embedder_id`` never triggers.
+        """
+        for other_id, other_dim in self._dims.items():
+            if other_dim != dim:
+                raise self._integrity_error(
+                    f"cannot store dim-{dim} vectors for "
+                    f"embedder_id={self._embedder_id!r} in a cache_dir that "
+                    f"already holds dim-{other_dim} vectors for "
+                    f"embedder_id={other_id!r}; the vector store holds one "
+                    f"output dimension per cache_dir. Use a separate cache_dir "
+                    f"per embedder output dimension, or clear this one"
+                )
+
     def _verify_live_dim_once(self) -> None:
         """Probe the live embedder's output dim and compare it to the cache.
 
@@ -348,6 +392,12 @@ class EmbeddingCache:
         window is impossible but that the loader detects the row-count desync and
         raises ``CacheIntegrityError`` on the next reopen rather than serving a
         mismatched cache.
+
+        ``np.stack`` here requires every row to share a width, which is why the
+        store holds one output dimension per ``cache_dir``. That invariant is
+        enforced upstream on append by ``_check_store_dim``, so by the time a
+        flush runs, ``self._vectors`` is already known to be uniform-width and
+        the stack cannot raise a ragged-shape ``ValueError``.
         """
         store = (
             np.stack(self._vectors, axis=0)
@@ -461,9 +511,11 @@ class EmbeddingCache:
 
             dim = int(computed.shape[1])
             # Validate dim against the store's existing dim for this embedder_id
-            # BEFORE mutating any in-memory state, so a drift never leaves the
-            # cache half-appended.
+            # AND against any OTHER embedder_id already in this cache_dir, BEFORE
+            # mutating any in-memory state, so a mismatch never leaves the cache
+            # half-appended.
             self._check_live_dim(dim)
+            self._check_store_dim(dim)
 
             for sha, vector in zip(miss_shas, computed, strict=True):
                 ref = len(self._vectors)

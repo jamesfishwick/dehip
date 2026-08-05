@@ -249,6 +249,35 @@ def test_appending_changed_dim_raises_clear_message(tmp_path):
         reopened.embed_one("second")
 
 
+def test_mixed_dim_embedders_one_cache_dir_raises_clear_message(tmp_path):
+    """Important: two embedder_ids of different dims in one cache_dir must raise.
+
+    The cache key space admits multiple embedder_ids per cache_dir, but the
+    vector store is a single dense array (``np.stack`` in ``_flush``), so it can
+    only hold one output dimension. Two DIFFERENT embedder_ids with different
+    output dims sharing one dir used to crash on the second's first flush with a
+    raw ``ValueError: all input arrays must have the same shape`` from
+    ``np.stack``. It must instead raise a ``CacheIntegrityError`` naming both
+    dims and pointing at the fix (separate cache_dir per dim).
+    """
+    cache_dir = tmp_path / "emb-cache"
+
+    emb_a = StubEmbedder(embedder_id="embedder-A", dim=4)
+    EmbeddingCache(emb_a, cache_dir=cache_dir).embed_one("a")  # one dim-4 row
+
+    # A distinct embedder_id emitting a different dim, over the same dir. The key
+    # is new (so same-id drift checks pass), but the store cannot hold both
+    # widths. Expect a clear CacheIntegrityError, never a raw np.stack ValueError.
+    emb_b = StubEmbedder(embedder_id="embedder-B", dim=8)
+    cache_b = EmbeddingCache(emb_b, cache_dir=cache_dir)
+    with pytest.raises(CacheIntegrityError) as exc:
+        cache_b.embed_one("b")
+
+    message = str(exc.value)
+    assert "4" in message and "8" in message  # both dims named
+    assert str(cache_dir) in message  # names the offending cache_dir
+
+
 def test_corrupt_index_parquet_raises_naming_path(tmp_path):
     """Important 7: a corrupt index.parquet raises a domain error, not a miss."""
     cache_dir = tmp_path / "emb-cache"
