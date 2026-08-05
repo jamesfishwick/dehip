@@ -113,10 +113,14 @@ def test_summarize_mean_median_over_known_inputs():
 
 
 def test_summarize_median_even_count_is_midpoint():
-    # Even count: median is the mean of the two central values (0.4, 0.6 -> 0.5).
-    summary = det.summarize_scores("s", "rewrite", [0.1, 0.4, 0.6, 0.9])
-    assert summary.median == pytest.approx(0.5)
-    assert summary.mean == pytest.approx(0.5)
+    # Even count: median is the mean of the two central values. Use an ASYMMETRIC
+    # set so median != mean -- 0.2 and 0.6 are the central pair (median 0.4) while
+    # the mean is 0.45. A median-becomes-mean mutation would then fail here (a
+    # symmetric set would let both mutants pass).
+    summary = det.summarize_scores("s", "rewrite", [0.1, 0.2, 0.6, 0.9])
+    assert summary.median == pytest.approx(0.4)
+    assert summary.mean == pytest.approx(0.45)
+    assert summary.median != pytest.approx(summary.mean)
 
 
 def test_summarize_histogram_bins_are_fixed_and_total_n():
@@ -184,6 +188,15 @@ def test_score_set_nan_response_is_a_failed_call():
         det.score_set("s", "rewrite", [("p0", "a")], client=client)
 
 
+def test_score_set_bool_response_is_a_failed_call():
+    # A bool is an int subclass, so True would pass a naive 0<=v<=1 check and
+    # silently count as human_prob 1.0. The _valid_human_prob bool guard rejects
+    # it as a malformed response -> DetectorCallError, never a fake 1.0 score.
+    client = OutOfRangeClient(True)  # noqa: FBT003 - deliberately a bool
+    with pytest.raises(det.DetectorCallError):
+        det.score_set("s", "rewrite", [("p0", "a")], client=client)
+
+
 # --- SC-005 delta ------------------------------------------------------------
 
 
@@ -209,6 +222,15 @@ def test_sc005_delta_below_threshold_fails():
 def test_sc005_delta_needs_exactly_one_draft_and_one_rewrite():
     only_draft = det.summarize_scores("d", "instruct_draft", [0.2])
     assert det.sc005_delta([only_draft]) is None
+
+
+def test_sc005_delta_two_rewrites_no_draft_returns_none():
+    # Two rewrite-role sets and zero drafts: the draft/rewrite comparison is
+    # undefined, so the delta is left unset (None) rather than guessed from an
+    # arbitrary pairing.
+    rw_a = det.summarize_scores("a", "rewrite", [0.6])
+    rw_b = det.summarize_scores("b", "rewrite", [0.7])
+    assert det.sc005_delta([rw_a, rw_b]) is None
 
 
 # --- DoD 2: per-text + summary persistence -----------------------------------
@@ -246,6 +268,19 @@ def test_write_artifacts_persists_per_text_and_summary(tmp_path):
     assert rows[0]["text_sha"] == content_sha256("a")
 
 
+def test_assemble_report_single_set_carries_sc005_not_computed_caveat():
+    # A single-set (or role-mismatched) run cannot compute the SC-005 delta, so
+    # the report's sc005 is None AND a sc005_not_computed caveat explains why --
+    # the empty delta must not read as a silent omission.
+    single = det.summarize_scores("s", "rewrite", [0.5])
+    report = det.assemble_report(
+        report_id="r", detector="pangram", seed=0, summaries=[single]
+    )
+    assert report.sc005 is None
+    kinds = {c.get("kind") for c in report.caveats if isinstance(c, dict)}
+    assert "sc005_not_computed" in kinds
+
+
 def test_write_artifacts_scores_path_is_sibling_jsonl(tmp_path):
     report = det.assemble_report(
         report_id="r",
@@ -259,6 +294,75 @@ def test_write_artifacts_scores_path_is_sibling_jsonl(tmp_path):
     )
     assert summary_path.name == "x-detect.json"
     assert scores_path.name == "x-detect.scores.jsonl"
+
+
+def test_write_artifacts_scores_path_uses_full_stem_multi_dot(tmp_path):
+    # A multi-dot --out must derive the scores sibling from the FULL stem, not a
+    # truncated one: a.b.json -> a.b.scores.jsonl, never a.scores.jsonl.
+    report = det.assemble_report(
+        report_id="r",
+        detector="pangram",
+        seed=0,
+        summaries=[det.summarize_scores("s", "rewrite", [0.5])],
+    )
+    out = tmp_path / "a.b.json"
+    summary_path, scores_path = det.write_detection_artifacts(
+        report, [], out_path=out
+    )
+    assert summary_path.name == "a.b.json"
+    assert scores_path.name == "a.b.scores.jsonl"
+
+
+def test_write_artifacts_rejects_non_json_out(tmp_path):
+    report = det.assemble_report(
+        report_id="r",
+        detector="pangram",
+        seed=0,
+        summaries=[det.summarize_scores("s", "rewrite", [0.5])],
+    )
+    with pytest.raises(ValueError, match="must end in .json"):
+        det.write_detection_artifacts(report, [], out_path=tmp_path / "report.tar.gz")
+
+
+def test_write_artifacts_summary_commit_failure_leaves_no_artifact(
+    tmp_path, monkeypatch
+):
+    # IMPORTANT: the two final artifacts are an all-or-nothing pair. If the SECOND
+    # commit (the summary os.replace) fails after the FIRST (the scores) landed,
+    # the already-committed scores file is rolled back so NEITHER final artifact
+    # survives, and no .tmp debris lingers. An orphaned complete-looking summary
+    # (or a lone scores file) would otherwise mislead a downstream reader.
+    import os as _os
+
+    report = det.assemble_report(
+        report_id="r",
+        detector="pangram",
+        seed=0,
+        summaries=[det.summarize_scores("s", "rewrite", [0.5])],
+    )
+    scores = [det.DetectorScore("s", "p0", content_sha256("a"), 0.5)]
+    out = tmp_path / "results" / "reports" / "pangram-detect.json"
+
+    real_replace = _os.replace
+    calls = {"n": 0}
+
+    def _replace_fail_second(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 2:  # the summary commit (scores commit is #1)
+            raise OSError("simulated summary-commit failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(_os, "replace", _replace_fail_second)
+
+    with pytest.raises(OSError):
+        det.write_detection_artifacts(report, scores, out_path=out)
+
+    # Neither final artifact survives.
+    assert not out.exists()
+    assert not out.with_name("pangram-detect.scores.jsonl").exists()
+    # No temp debris left behind.
+    debris = [p.name for p in out.parent.iterdir() if p.name.endswith(".tmp")]
+    assert debris == []
 
 
 # --- DoD 3: missing-key exit 3 with ZERO detector calls ----------------------
@@ -393,3 +497,132 @@ def test_cli_default_out_path_under_results_reports(tmp_path, monkeypatch):
     assert rc == cli.EXIT_SUCCESS
     # Default lands under results/reports/.
     assert (tmp_path / "results" / "reports" / "pangram-detect.json").exists()
+
+
+# --- IMPORTANT 2: SC-005 uncomputable on a run that requested it -------------
+
+
+def test_cli_two_rewrites_exits_non_ok_naming_reason(tmp_path, monkeypatch, capsys):
+    # Two sets were given, so a delta was requested; both are rewrites, so it
+    # cannot be computed. The command must NOT report ok after paid spend: a
+    # non-ok status naming the reason AND a distinct non-zero exit code, while the
+    # per-set artifacts are still written.
+    monkeypatch.setenv("PANGRAM_API_KEY", "test-key")
+    a = _write_set(tmp_path, "a", "a", "rewrite", {"p0": "aaa"})
+    b = _write_set(tmp_path, "b", "b", "rewrite", {"p0": "bbb"})
+    monkeypatch.setattr(
+        det, "build_client", lambda *a, **k: MappingClient({"aaa": 0.6, "bbb": 0.7})
+    )
+    out = tmp_path / "o.json"
+    rc = cli.main(["detect", "--sets", a, b, "--out", str(out)])
+
+    assert rc != cli.EXIT_SUCCESS
+    assert rc == cli.EXIT_SC005_NOT_COMPUTED
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "sc005_not_computed"
+    assert payload["sc005"] is None
+    # Artifacts are still written (the per-set summaries remain useful).
+    assert out.exists()
+    assert out.with_suffix(".scores.jsonl").exists()
+
+
+def test_cli_single_set_null_sc005_still_ok(tmp_path, monkeypatch, capsys):
+    # A single-set run never requested a delta, so its null sc005 stays ok (0).
+    monkeypatch.setenv("PANGRAM_API_KEY", "test-key")
+    s = _write_set(tmp_path, "s", "s", "rewrite", {"p0": "aaa"})
+    monkeypatch.setattr(
+        det, "build_client", lambda *a, **k: MappingClient({"aaa": 0.7})
+    )
+    out = tmp_path / "o.json"
+    rc = cli.main(["detect", "--sets", s, "--out", str(out)])
+    assert rc == cli.EXIT_SUCCESS
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ok"
+    assert payload["sc005"] is None
+
+
+# --- IMPORTANT 3: duplicate pair_id fails loudly before any spend ------------
+
+
+def test_cli_duplicate_pair_id_exits_2_zero_calls(tmp_path, monkeypatch, capsys):
+    # A manifest listing the same pair_id twice would double-score and double-pay.
+    # Detect it before counting/scoring and fail loudly (exit 2) with ZERO
+    # detector calls.
+    monkeypatch.setenv("PANGRAM_API_KEY", "test-key")
+    exploding = ExplodingClient()
+    monkeypatch.setattr(det, "build_client", lambda *a, **k: exploding)
+
+    # Hand-write a manifest with a duplicated pair_id (bypasses _write_set, which
+    # dedups via a dict).
+    manifest = TextSet(
+        set_id="s",
+        role="rewrite",
+        corpus="fineweb",
+        pair_ids=["p0", "p0"],
+        provenance={"texts_path": "s.jsonl"},
+    )
+    manifest_path = tmp_path / "s.manifest.json"
+    write_json(manifest, manifest_path)
+    with (tmp_path / "s.jsonl").open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"pair_id": "p0", "text": "aaa"}) + "\n")
+
+    out = tmp_path / "o.json"
+    rc = cli.main(["detect", "--sets", str(manifest_path), "--out", str(out)])
+    assert rc == cli.EXIT_VALIDATION == 2
+    assert exploding.calls == 0  # no detector call before the validation failure
+    assert not out.exists()
+    err = capsys.readouterr().err
+    assert "duplicate pair_id" in err
+    assert "p0" in err
+
+
+# --- NIT 2: --out must end in .json ------------------------------------------
+
+
+def test_cli_non_json_out_exits_2_zero_calls(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("PANGRAM_API_KEY", "test-key")
+    exploding = ExplodingClient()
+    monkeypatch.setattr(det, "build_client", lambda *a, **k: exploding)
+    s = _write_set(tmp_path, "s", "s", "rewrite", {"p0": "aaa"})
+    rc = cli.main(["detect", "--sets", s, "--out", str(tmp_path / "report.tar.gz")])
+    assert rc == cli.EXIT_VALIDATION == 2
+    assert exploding.calls == 0
+    assert "must end in .json" in capsys.readouterr().err
+
+
+# --- IMPORTANT 4(5): multi-set, later set fails -> exit 3, NO artifacts -------
+
+
+def test_cli_later_set_failure_exits_3_no_artifacts(tmp_path, monkeypatch, capsys):
+    # An earlier set scores clean, then a later set's call fails. The whole run
+    # must fail loudly (exit 3) and leave NO artifacts -- a partial report over
+    # only the clean set would read as a real, complete run. Locks the current
+    # no-leak behavior.
+    monkeypatch.setenv("PANGRAM_API_KEY", "test-key")
+
+    class _FailOnSecondSet:
+        # Clean for the first set's text, then raises on the second set's text.
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def score_text(self, text: str) -> float:
+            self.calls.append(text)
+            if text == "bbb":
+                raise ConnectionError("simulated failure on the second set")
+            return 0.7
+
+    client = _FailOnSecondSet()
+    monkeypatch.setattr(det, "build_client", lambda *a, **k: client)
+
+    draft = _write_set(tmp_path, "draft", "draft", "instruct_draft", {"p0": "aaa"})
+    rewrite = _write_set(tmp_path, "rw", "rw", "rewrite", {"p0": "bbb"})
+    out = tmp_path / "o.json"
+
+    rc = cli.main(["detect", "--sets", draft, rewrite, "--out", str(out)])
+    assert rc == cli.EXIT_EXTERNAL_DEP == 3
+    # The clean set was scored, then the failure aborted the run.
+    assert client.calls == ["aaa", "bbb"]
+    # No artifact from the partially-scored run.
+    assert not out.exists()
+    assert not out.with_suffix(".scores.jsonl").exists()
+    assert "detector call failed" in capsys.readouterr().err

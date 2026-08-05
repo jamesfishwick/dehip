@@ -12,6 +12,8 @@ contract (all commands):
     2  validation failure (bad or unknown args)
     3  external dependency failure (HIP checkout, API auth)
     4  self-check out of bounds
+    5  report-write I/O failure
+    6  detect: SC-005 delta requested (two sets) but not computable
 
 argparse already exits 2 on unknown or malformed flags, matching the contract.
 """
@@ -32,6 +34,14 @@ EXIT_SELF_CHECK = 4
 # or embedder dependency failure; a dedicated code makes the artifact I/O
 # failure unambiguous to a caller.
 EXIT_IO = 5
+# detect: the run requested an SC-005 delta (two sets given) but it could not be
+# computed (not exactly one instruct_draft + one rewrite). Distinct from success
+# so a caller can tell a computed delta from a paid run that produced no decision;
+# distinct from EXIT_VALIDATION because the inputs were structurally accepted and
+# scored (the per-set summaries are still written) -- only the comparison is
+# missing. The artifacts are kept; the JSON status is non-ok and this code is
+# returned so the null sc005 is loud, not silent.
+EXIT_SC005_NOT_COMPUTED = 6
 
 # Every subcommand name in the CLI contract, in pipeline order.
 COMMANDS = (
@@ -913,6 +923,18 @@ def _run_detect(args: argparse.Namespace) -> int:
         )
         return EXIT_EXTERNAL_DEP
 
+    # Validate a user-supplied --out ends in .json BEFORE any spend: a non-.json
+    # path would mangle the derived scores sibling and report_id (see
+    # detector.scores_path_for). The default path is always .json. Pure input
+    # validation -> exit 2 with zero detector calls.
+    out_path = args.out or f"results/reports/{args.detector}-detect.json"
+    if not str(out_path).endswith(".json"):
+        _progress(
+            f"dehip detect: --out must end in .json, got {out_path!r} "
+            "(a non-.json path would mangle the scores sibling and report_id)."
+        )
+        return EXIT_VALIDATION
+
     # Load every manifest + its texts via the SAME conventions the score command
     # uses (report._texts_path_for / report._read_pair_texts) -- no parallel
     # manifest reader. A bad path, bad-version/shape manifest, or duplicate id is
@@ -923,6 +945,24 @@ def _run_detect(args: argparse.Namespace) -> int:
         for manifest in args.sets:
             manifest_path = Path(manifest)
             text_set: TextSet = read_json(manifest_path, TextSet)
+            # Reject a manifest listing the same pair_id twice BEFORE counting or
+            # scoring: a duplicate would score and pay for that text twice and
+            # skew the set mean. Fail loudly (exit 2) naming the duplicate, in
+            # keeping with the validation-before-spend discipline -- never
+            # silently de-duplicate a paid run.
+            seen: set[str] = set()
+            duplicates: list[str] = []
+            for pair_id in text_set.pair_ids:
+                if pair_id in seen:
+                    duplicates.append(pair_id)
+                seen.add(pair_id)
+            if duplicates:
+                raise ValueError(
+                    f"manifest {manifest!r} lists duplicate pair_id(s) "
+                    f"{sorted(set(duplicates))!r}; each pair_id must appear once "
+                    "(a duplicate would double-score, double-pay, and skew the "
+                    "set mean)"
+                )
             texts_by_id = report_mod._read_pair_texts(
                 report_mod._texts_path_for(manifest_path, text_set.provenance)
             )
@@ -983,7 +1023,6 @@ def _run_detect(args: argparse.Namespace) -> int:
         _progress(f"dehip detect: input error: {exc}")
         return EXIT_VALIDATION
 
-    out_path = args.out or f"results/reports/{args.detector}-detect.json"
     report = detector_mod.assemble_report(
         report_id=Path(out_path).stem,
         detector=args.detector,
@@ -1001,11 +1040,32 @@ def _run_detect(args: argparse.Namespace) -> int:
         return EXIT_IO
     _progress(f"dehip detect: wrote {summary_path} and {scores_path}")
 
+    # A run that GAVE two or more sets requested an SC-005 delta; if the delta
+    # could not be computed (not exactly one instruct_draft + one rewrite -- e.g.
+    # two rewrites, or a mislabeled role), surface it loudly instead of reporting
+    # ok with sc005 null after paid spend. Keep the artifacts (the per-set
+    # summaries are still useful) but report a non-ok status and return a distinct
+    # non-zero code so a caller can tell a computed delta from a paid run that
+    # produced no decision. A single-set run never requested a delta, so its null
+    # sc005 stays ok (exit 0).
+    sc005_requested = len(args.sets) >= 2
+    if sc005_requested and report.sc005 is None:
+        status = "sc005_not_computed"
+        exit_code = EXIT_SC005_NOT_COMPUTED
+        _progress(
+            "dehip detect: SC-005 delta could not be computed (need exactly one "
+            "instruct_draft and one rewrite set); artifacts written but the run "
+            "produced no decision."
+        )
+    else:
+        status = "ok"
+        exit_code = EXIT_SUCCESS
+
     json.dump(
         {
             "command": "detect",
             "seed": args.seed,
-            "status": "ok",
+            "status": status,
             "detector": args.detector,
             "n_sets": report.n_sets,
             "out": str(summary_path),
@@ -1015,7 +1075,7 @@ def _run_detect(args: argparse.Namespace) -> int:
         sys.stdout,
     )
     sys.stdout.write("\n")
-    return EXIT_SUCCESS
+    return exit_code
 
 
 def _add_detect(subparsers: argparse._SubParsersAction) -> None:

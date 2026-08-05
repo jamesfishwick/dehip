@@ -68,6 +68,7 @@ __all__ = [
     "score_set",
     "score_sets",
     "sc005_delta",
+    "scores_path_for",
     "write_detection_artifacts",
 ]
 
@@ -82,7 +83,15 @@ ENV_KEY_BY_DETECTOR: dict[str, str] = {
 # Cost-gate constants, mirroring jmq.DEFAULT_COST_PER_CALL_USD / the score
 # command's $1.00 threshold. One detector call per text; a run whose estimate is
 # above the threshold needs --yes.
-DEFAULT_COST_PER_TEXT_USD = 0.001
+#
+# ESTIMATE (verify before relying on it for budgeting): real detector spend is
+# per-word, not per-call. Pangram's API is ~$0.05 per 1,000 words
+# (https://www.pangram.com/pricing); GPTZero is in the same range. A single
+# harness text of ~200 words is therefore ~$0.01, and longer texts cost more, so
+# $0.001 (0.1 cent) under-gates real spend by 10x-plus and would let a several-
+# hundred-text run proceed without --yes. $0.01/text is a conservative floor for
+# a typical short text; raise it if the corpus runs long.
+DEFAULT_COST_PER_TEXT_USD = 0.01
 DEFAULT_SPEND_THRESHOLD_USD = 1.0
 
 # Fixed histogram bins for the human-probability distribution. Ten equal-width
@@ -639,6 +648,24 @@ def assemble_report(
     )
 
 
+def scores_path_for(out_path: str | Path) -> Path:
+    """Return the per-text scores sibling for a ``.json`` summary ``out_path``.
+
+    The scores JSONL is named from the summary's *full* stem so a multi-dot path
+    is not silently mangled: ``a.b.json`` -> ``a.b.scores.jsonl`` (using the whole
+    ``a.b`` stem), never ``a.scores.jsonl``. ``out_path`` must end in ``.json``;
+    a non-``.json`` path raises :class:`ValueError` (the CLI maps that to exit 2)
+    rather than deriving a mangled sibling from an unexpected suffix.
+    """
+    summary_path = Path(out_path)
+    if summary_path.suffix != ".json":
+        raise ValueError(
+            f"--out must end in .json, got {str(out_path)!r}; a non-.json path "
+            "would mangle the derived scores sibling and report_id"
+        )
+    return summary_path.with_name(f"{summary_path.stem}.scores.jsonl")
+
+
 def write_detection_artifacts(
     report: DetectionReport,
     scores: Sequence[DetectorScore],
@@ -647,20 +674,32 @@ def write_detection_artifacts(
 ) -> tuple[Path, Path]:
     """Persist BOTH the per-text scores and the summary report under ``out_path``.
 
-    Writes two artifacts as an all-or-nothing pair beside ``out_path``:
+    Writes two artifacts beside ``out_path`` and commits them in a fixed order so
+    a mid-commit failure never leaves a misleading complete-looking summary with
+    no scores:
 
-    - the summary JSON at ``out_path`` (the single SC-005 artifact), and
-    - the per-text scores JSONL at ``<out_path stem>.scores.jsonl`` (one row per
-      text -- the per-text persistence SC-005 review demands, not just the mean).
+    - the per-text scores JSONL at ``<full stem>.scores.jsonl`` (the row-level
+      audit trail -- committed FIRST because it matters most), and
+    - the summary JSON at ``out_path`` (the single SC-005 artifact, committed
+      SECOND).
 
-    Both are staged to temp files first and only committed with :func:`os.replace`
-    once both temps are on disk, so a failure leaves NEITHER final artifact and no
-    temp debris. Returns the ``(summary_path, scores_path)`` pair.
+    Both texts are staged to temp files first; if either staging write fails,
+    both temps are cleaned up and NEITHER final artifact exists. The commits then
+    run scores-first, summary-second, each via :func:`os.replace`. If the second
+    commit (the summary) fails, the already-committed scores file is rolled back
+    (unlinked) so neither final artifact survives -- an orphaned scores file with
+    no summary would otherwise linger, and (worse, before this ordering) an
+    orphaned summary with no scores would read downstream as a successful run.
+    The guarantee is therefore all-or-nothing on the final pair, with no temp
+    debris left behind on any failure path.
+
+    ``out_path`` must end in ``.json`` (see :func:`scores_path_for`); a non-.json
+    path raises :class:`ValueError`.
     """
     import os
 
     summary_path = Path(out_path)
-    scores_path = summary_path.with_suffix(".scores.jsonl")
+    scores_path = scores_path_for(out_path)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
 
     summary_text = json.dumps(asdict(report), ensure_ascii=False, indent=2) + "\n"
@@ -668,11 +707,14 @@ def write_detection_artifacts(
         json.dumps(asdict(s), ensure_ascii=False) + "\n" for s in scores
     )
 
+    # Stage both temps first. If either write fails, unlink every temp and leave
+    # no final artifact. Order the staged pair scores-first so the commit loop
+    # writes the row-level audit trail before the summary that consumers trust.
     staged: list[tuple[Path, Path]] = []
     try:
         for final, text in (
-            (summary_path, summary_text),
             (scores_path, scores_text),
+            (summary_path, summary_text),
         ):
             tmp = final.with_name(f"{final.name}.{os.getpid()}.tmp")
             tmp.write_text(text, encoding="utf-8")
@@ -685,6 +727,25 @@ def write_detection_artifacts(
                 pass
         raise
 
-    for tmp, final in staged:
-        os.replace(tmp, final)
+    # Commit in staged (scores-first) order, tracking what landed. If a commit
+    # fails partway, roll back every already-committed final AND drop any temps
+    # not yet committed, so neither final artifact survives and no temp lingers.
+    committed: list[Path] = []
+    try:
+        for tmp, final in staged:
+            os.replace(tmp, final)
+            committed.append(final)
+    except OSError:
+        for final in committed:
+            try:
+                final.unlink()
+            except OSError:
+                pass
+        for tmp, _final in staged:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+
     return summary_path, scores_path
