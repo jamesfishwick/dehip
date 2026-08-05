@@ -57,7 +57,7 @@ Output of one cascade run for one pair (FR-005, FR-006). JSONL, one bundle per p
 
 ## JudgeVerdict
 
-One (pair, dimension) comparison (FR-002, FR-008). JSONL under `results/runs/{run_id}/verdicts.jsonl`, written before aggregation.
+One (pair, dimension) comparison (FR-002, FR-008). JSONL written before aggregation. The `dehip score` command has no run_id concept and writes verdicts beside its report at `<out-dir>/verdicts.jsonl` (the directory of `--out`). The rewrite/run pipeline (a later ticket) is where a `results/runs/{run_id}/verdicts.jsonl` layout applies.
 
 | Field | Type | Notes |
 |---|---|---|

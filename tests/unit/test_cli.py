@@ -34,11 +34,13 @@ VALID_INVOCATIONS = {
 
 ALL_COMMANDS = sorted(cli.COMMANDS)
 
-# build-corpus is implemented (issue #5): it no longer emits a stub summary and
-# its real handler needs an API key, so the stub-behavior tests below run over
-# the remaining stubs. Flag-rejection (argparse, pre-handler) still covers all.
-STUB_COMMANDS = [c for c in ALL_COMMANDS if c != "build-corpus"]
-
+# Commands still served by the shared stub. ``build-corpus`` (issue #5) and
+# ``score`` (issue #10) became real commands, so their handlers no longer emit
+# the {"status": "stub"} summary and are excluded from the stub-shape assertions
+# below (their behavior is covered by test_corpus.py and test_score_cli.py).
+# Flag-rejection (argparse, pre-handler) still covers every command. The rest
+# remain stubs until their own tickets.
+STUB_COMMANDS = sorted(set(cli.COMMANDS) - {"build-corpus", "score"})
 
 def _run_cli(argv):
     """Run the CLI as a subprocess so stdout/stderr are cleanly separated."""
