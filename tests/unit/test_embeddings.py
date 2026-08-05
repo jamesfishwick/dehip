@@ -11,8 +11,13 @@ import hashlib
 from collections.abc import Sequence
 
 import numpy as np
+import pytest
 
-from dehip.metrics.embeddings import EmbeddingCache, content_sha256
+from dehip.metrics.embeddings import (
+    CacheIntegrityError,
+    EmbeddingCache,
+    content_sha256,
+)
 
 
 class StubEmbedder:
@@ -35,7 +40,7 @@ class StubEmbedder:
         keyed = f"{self.embedder_id}\x00{text}".encode()
         seed = int.from_bytes(hashlib.sha256(keyed).digest()[:8], "big")
         rng = np.random.default_rng(seed)
-        return rng.standard_normal(self.dim)
+        return rng.standard_normal(self.dim).astype(np.float32)
 
 
 def test_second_request_hits_cache_and_skips_recompute(tmp_path):
@@ -127,3 +132,100 @@ def test_same_text_different_embedder_is_distinct_entry(tmp_path):
     cache_a2 = EmbeddingCache(stub_a2, cache_dir=cache_dir)
     np.testing.assert_array_equal(vec_a, cache_a2.embed_one("shared text"))
     assert stub_a2.calls == 0
+
+
+# --- Integrity / hardening tests (Korgull findings) -----------------------
+
+
+def test_forged_index_mapping_raises_on_read(tmp_path):
+    """Critical 1: a key that resolves to a mismatched store row must raise.
+
+    The index maps a key to a store ref; a corrupt/forged index (or a store
+    swapped under a stale index) can point a key at a row whose recorded
+    provenance is a different sha. The read path must re-check the row's
+    provenance against the requested key and raise, not hand back the wrong
+    vector. Here we drive that guard directly: the on-disk row for ref 0 records
+    "beta"'s sha, yet a lookup for "alpha" resolves to ref 0.
+    """
+    cache_dir = tmp_path / "emb-cache"
+    stub = StubEmbedder()
+    cache = EmbeddingCache(stub, cache_dir=cache_dir)
+    cache.embed(["alpha", "beta"])  # two rows
+
+    sha_alpha = content_sha256("alpha")
+    sha_beta = content_sha256("beta")
+
+    reopened = EmbeddingCache(StubEmbedder(), cache_dir=cache_dir)
+    # Simulate a stale/forged index whose key points at a row owned by another
+    # sha: row (ref) for beta is where alpha's key now resolves.
+    ref_beta = reopened._index[(stub.embedder_id, sha_beta)]
+    reopened._index[(stub.embedder_id, sha_alpha)] = ref_beta
+
+    with pytest.raises(CacheIntegrityError):
+        reopened.get("alpha")
+
+
+def test_changed_output_dim_same_embedder_id_raises(tmp_path):
+    """Critical 2: model/dim drift under a stable embedder_id must raise."""
+    cache_dir = tmp_path / "emb-cache"
+    cache = EmbeddingCache(StubEmbedder(dim=8), cache_dir=cache_dir)
+    cache.embed_one("drifting text")
+
+    # Same embedder_id, different output dim -> stale/mixed spaces.
+    drifted = StubEmbedder(embedder_id="stub-embedder-v1", dim=16)
+    reopened = EmbeddingCache(drifted, cache_dir=cache_dir)
+    with pytest.raises(CacheIntegrityError):
+        reopened.embed_one("new text")
+
+
+def test_desynced_store_fewer_rows_than_index_raises(tmp_path):
+    """Critical 4: index refs beyond the store's row count must raise on load."""
+    cache_dir = tmp_path / "emb-cache"
+    stub = StubEmbedder()
+    cache = EmbeddingCache(stub, cache_dir=cache_dir)
+    cache.embed(["one", "two", "three"])  # three store rows
+
+    # Truncate the store to a single row while the index still names three.
+    stored = np.load(cache_dir / "vectors.npy", allow_pickle=False)
+    np.save(cache_dir / "vectors.npy", stored[:1], allow_pickle=False)
+
+    with pytest.raises(CacheIntegrityError):
+        EmbeddingCache(StubEmbedder(), cache_dir=cache_dir)
+
+
+def test_appending_changed_dim_raises_clear_message(tmp_path):
+    """Important 5: a changed-dim append under one embedder_id raises clearly."""
+    cache_dir = tmp_path / "emb-cache"
+    cache = EmbeddingCache(StubEmbedder(dim=8), cache_dir=cache_dir)
+    cache.embed_one("first")
+
+    # Reopen and append a vector of a different width under the same id.
+    wider = StubEmbedder(embedder_id="stub-embedder-v1", dim=16)
+    reopened = EmbeddingCache(wider, cache_dir=cache_dir)
+    with pytest.raises(CacheIntegrityError, match="dim"):
+        reopened.embed_one("second")
+
+
+def test_corrupt_index_parquet_raises_naming_path(tmp_path):
+    """Important 7: a corrupt index.parquet raises a domain error, not a miss."""
+    cache_dir = tmp_path / "emb-cache"
+    cache = EmbeddingCache(StubEmbedder(), cache_dir=cache_dir)
+    cache.embed_one("real content")
+
+    # Clobber the parquet with garbage bytes.
+    (cache_dir / "index.parquet").write_bytes(b"not a parquet file at all")
+
+    with pytest.raises(CacheIntegrityError) as exc:
+        EmbeddingCache(StubEmbedder(), cache_dir=cache_dir)
+    assert str(cache_dir) in str(exc.value)
+
+
+def test_embed_fn_without_embedder_id_raises(tmp_path):
+    """Nit 8: embed_fn must carry an explicit embedder_id."""
+
+    class NoIdEmbedder:
+        def __call__(self, texts):
+            return np.zeros((len(list(texts)), 8), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="embedder_id"):
+        EmbeddingCache(NoIdEmbedder(), cache_dir=tmp_path / "emb-cache")

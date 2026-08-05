@@ -10,11 +10,26 @@ The cache (see data-model.md, EmbeddingCacheEntry) is append-only and keyed by
 ``(embedder_id, content SHA-256)``. It stores a parquet index plus an npy vector
 store under ``data/emb-cache/``. The same text under a different ``embedder_id`` is
 a distinct entry. Existing entries are never rewritten and there is no eviction.
+
+Integrity model
+---------------
+The cache is defensive against silent corruption and drift. Every stored vector
+carries its own ``content_sha256`` and ``embedder_id`` in the index, aligned
+row-for-row with the vector store, and each read re-checks that the row it is
+about to return actually belongs to the requested ``(embedder_id, sha)``. A
+per-``embedder_id`` output dimension is recorded so that a model change hiding
+behind an unchanged ``embedder_id`` is caught rather than served as stale
+vectors. Writes are atomic (temp file + ``os.replace``, store before index) so a
+crash mid-flush can never leave a visible half-written cache. Any detected
+corruption or desync raises ``CacheIntegrityError`` naming the ``cache_dir`` and
+the recovery step (clear that directory), rather than degrading into an opaque
+``IndexError`` or silently re-embedding over the damage.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -25,6 +40,22 @@ import pyarrow.parquet as pq
 
 DEFAULT_CACHE_DIR = Path("data/emb-cache")
 DEFAULT_EMBEDDER_ID = "nvidia/llama-embed-nemotron-8b"
+
+# Vectors are stored deliberately as float32: it is the precision the Embedder
+# protocol promises, it halves the on-disk footprint versus float64, and it is
+# lossless for the fp16/fp32 model outputs the production embedder produces. The
+# cache asserts this on append rather than silently downcasting a wider dtype,
+# so a protocol violation surfaces loudly instead of corrupting recall math.
+_STORE_DTYPE = np.float32
+
+
+class CacheIntegrityError(RuntimeError):
+    """Raised when the on-disk embedding cache is corrupt, desynced, or drifted.
+
+    The message always names the offending ``cache_dir`` and the recovery step
+    (clear that directory to rebuild the cache from scratch), because every one
+    of these conditions means the persisted state can no longer be trusted.
+    """
 
 
 @runtime_checkable
@@ -130,6 +161,11 @@ class EmbeddingCache:
     offset into the store. Existing entries are never rewritten. The index and
     store live under ``cache_dir`` (default ``data/emb-cache/``) so the cache
     survives across process restarts and fresh ``EmbeddingCache`` instances.
+
+    The index doubles as a per-row provenance record: ``content_sha256`` and
+    ``embedder_id`` are stored aligned with each store row, so every read can
+    confirm the row it returns belongs to the requested key, and the loader can
+    detect a store/index desync before it becomes an opaque ``IndexError``.
     """
 
     _INDEX_SCHEMA = pa.schema(
@@ -146,39 +182,139 @@ class EmbeddingCache:
         *,
         cache_dir: Path | str = DEFAULT_CACHE_DIR,
     ) -> None:
+        embedder_id = getattr(embed_fn, "embedder_id", None)
+        if not embedder_id:
+            raise ValueError(
+                "embed_fn must carry a non-empty 'embedder_id' attribute; the "
+                "cache key and per-embedder dim fingerprint depend on it. Set "
+                "embed_fn.embedder_id explicitly (e.g. the model name)."
+            )
         self._embed_fn = embed_fn
-        self._embedder_id = getattr(embed_fn, "embedder_id", DEFAULT_EMBEDDER_ID)
+        self._embedder_id = embedder_id
         self._cache_dir = Path(cache_dir)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._index_path = self._cache_dir / "index.parquet"
         self._store_path = self._cache_dir / "vectors.npy"
 
-        # In-memory mirror of the on-disk state: (embedder_id, sha) -> vector_ref.
+        # In-memory mirror of the on-disk state. ``_index`` maps
+        # (embedder_id, sha) -> vector_ref; ``_rows`` records the provenance
+        # (embedder_id, sha) for each store row so a read can re-verify it, and
+        # ``_dims`` records the output dim seen per embedder_id for drift checks.
         self._index: dict[tuple[str, str], int] = {}
         self._vectors: list[np.ndarray] = []
+        self._rows: list[tuple[str, str]] = []
+        self._dims: dict[str, int] = {}
         self._load()
+
+    def _integrity_error(self, detail: str) -> CacheIntegrityError:
+        return CacheIntegrityError(
+            f"{detail} (cache_dir={self._cache_dir}). Recovery: clear this "
+            f"directory to rebuild the cache from scratch."
+        )
 
     def _load(self) -> None:
         if not self._index_path.exists() or not self._store_path.exists():
             return
-        table = pq.read_table(self._index_path)
-        stored = np.load(self._store_path, allow_pickle=False)
-        self._vectors = [row.copy() for row in stored]
-        for sha, emb_id, ref in zip(
-            table.column("content_sha256").to_pylist(),
-            table.column("embedder_id").to_pylist(),
-            table.column("vector_ref").to_pylist(),
-            strict=True,
-        ):
+
+        try:
+            table = pq.read_table(self._index_path)
+        except Exception as exc:  # noqa: BLE001 - normalize to a domain error
+            # A parse failure means a genuinely corrupt index. Do NOT treat this
+            # as a cache miss: silently re-embedding would write fresh entries on
+            # top of the corruption and mask it. Fail loudly instead.
+            raise self._integrity_error(
+                f"index.parquet is unreadable ({type(exc).__name__}: {exc})"
+            ) from exc
+
+        try:
+            stored = np.load(self._store_path, allow_pickle=False)
+        except Exception as exc:  # noqa: BLE001 - normalize to a domain error
+            raise self._integrity_error(
+                f"vectors.npy is unreadable ({type(exc).__name__}: {exc})"
+            ) from exc
+
+        shas = table.column("content_sha256").to_pylist()
+        emb_ids = table.column("embedder_id").to_pylist()
+        refs = table.column("vector_ref").to_pylist()
+
+        n_rows = len(stored)
+        if len(shas) != n_rows:
+            raise self._integrity_error(
+                f"index/store desync: index has {len(shas)} entries but the "
+                f"vector store has {n_rows} rows"
+            )
+
+        # Rebuild the row-aligned provenance and the key -> ref map, validating
+        # that every ref is in range and points at the row the index claims.
+        rows: list[tuple[str, str] | None] = [None] * n_rows
+        for sha, emb_id, ref in zip(shas, emb_ids, refs, strict=True):
+            if not isinstance(ref, int) or ref < 0 or ref >= n_rows:
+                raise self._integrity_error(
+                    f"index/store desync: vector_ref {ref!r} is out of range for "
+                    f"a store of {n_rows} rows"
+                )
+            if rows[ref] is not None:
+                raise self._integrity_error(
+                    f"index corruption: vector_ref {ref} is claimed by two "
+                    f"entries"
+                )
+            rows[ref] = (emb_id, sha)
             self._index[(emb_id, sha)] = ref
 
+        if any(r is None for r in rows):
+            raise self._integrity_error(
+                "index/store desync: some store rows have no index entry"
+            )
+
+        self._vectors = [row.copy() for row in stored]
+        self._rows = [r for r in rows if r is not None]
+
+        # Record and cross-check the per-embedder output dim. A store row's width
+        # is the embedder's output dim; two rows for one embedder_id must match.
+        for (emb_id, _sha), vec in zip(self._rows, self._vectors, strict=True):
+            dim = int(vec.shape[0])
+            existing = self._dims.get(emb_id)
+            if existing is None:
+                self._dims[emb_id] = dim
+            elif existing != dim:
+                raise self._integrity_error(
+                    f"cached vectors for embedder_id={emb_id!r} disagree on dim "
+                    f"({existing} vs {dim})"
+                )
+
+    def _check_live_dim(self, dim: int) -> None:
+        """Assert the live embedder's output dim matches the cached one.
+
+        Catches a model/config change hiding behind an unchanged ``embedder_id``:
+        the cache holds vectors of the old width, the live model now emits a
+        different width, and serving the cached rows would mix incompatible
+        spaces. Raises loudly so the caller bumps the embedder_id or clears the
+        cache instead of silently getting stale vectors.
+        """
+        cached = self._dims.get(self._embedder_id)
+        if cached is not None and cached != dim:
+            raise self._integrity_error(
+                f"output-dim drift for embedder_id={self._embedder_id!r}: cached "
+                f"vectors are dim {cached} but the live embedder emitted dim "
+                f"{dim}. Bump the embedder_id or clear the cache"
+            )
+
     def _flush(self) -> None:
+        """Atomically persist the store and index (store first, then index).
+
+        Each artifact is written to a uniquely-named temp file in ``cache_dir``
+        and ``os.replace``'d into place, which is atomic on the same filesystem.
+        The store is replaced before the index, so the index a reader sees never
+        references a store row that is not yet on disk; a crash between the two
+        replaces leaves the previous (consistent) index in place and cannot
+        expose a half-written orphan.
+        """
         store = (
             np.stack(self._vectors, axis=0)
             if self._vectors
-            else np.empty((0, 0), dtype=np.float32)
+            else np.empty((0, 0), dtype=_STORE_DTYPE)
         )
-        np.save(self._store_path, store, allow_pickle=False)
+        self._atomic_write_npy(self._store_path, store)
 
         keys = list(self._index.items())
         table = pa.table(
@@ -189,14 +325,48 @@ class EmbeddingCache:
             },
             schema=self._INDEX_SCHEMA,
         )
-        pq.write_table(table, self._index_path)
+        self._atomic_write_parquet(self._index_path, table)
+
+    def _atomic_write_npy(self, path: Path, array: np.ndarray) -> None:
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{id(array)}.tmp")
+        try:
+            with open(tmp, "wb") as fh:
+                np.save(fh, array, allow_pickle=False)
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _atomic_write_parquet(self, path: Path, table: pa.Table) -> None:
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{id(table)}.tmp")
+        try:
+            pq.write_table(table, tmp)
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _vector_for(self, ref: int, sha: str) -> np.ndarray:
+        """Return the store row at ``ref`` after verifying it owns ``sha``.
+
+        The index maps a key to a ref, but a corrupt or forged index could point
+        the key at the wrong row. Re-check the row's recorded provenance against
+        the requested (embedder_id, sha) before trusting it.
+        """
+        row_emb_id, row_sha = self._rows[ref]
+        if row_emb_id != self._embedder_id or row_sha != sha:
+            raise self._integrity_error(
+                f"index maps (embedder_id={self._embedder_id!r}, sha={sha}) to "
+                f"store row {ref}, but that row holds "
+                f"(embedder_id={row_emb_id!r}, sha={row_sha})"
+            )
+        return self._vectors[ref].copy()
 
     def get(self, text: str) -> np.ndarray | None:
         """Return the cached vector for ``text`` under this embedder, or None."""
-        ref = self._index.get((self._embedder_id, content_sha256(text)))
+        sha = content_sha256(text)
+        ref = self._index.get((self._embedder_id, sha))
         if ref is None:
             return None
-        return self._vectors[ref].copy()
+        return self._vector_for(ref, sha)
 
     def embed(self, texts: Sequence[str]) -> np.ndarray:
         """Return embeddings for ``texts``, computing only cache misses.
@@ -208,7 +378,7 @@ class EmbeddingCache:
         """
         texts = list(texts)
         if not texts:
-            return np.empty((0, 0), dtype=np.float32)
+            return np.empty((0, 0), dtype=_STORE_DTYPE)
 
         shas = [content_sha256(t) for t in texts]
 
@@ -232,14 +402,37 @@ class EmbeddingCache:
                     f"embed_fn returned {computed.shape[0]} vectors "
                     f"for {len(miss_texts)} texts"
                 )
+            if computed.ndim != 2:
+                raise ValueError(
+                    f"embed_fn must return a 2-D array; got ndim={computed.ndim}"
+                )
+            if computed.dtype != _STORE_DTYPE:
+                # Protocol says float32. Refuse a wider/narrower dtype instead of
+                # silently casting and losing (or misrepresenting) precision.
+                raise ValueError(
+                    f"embed_fn must return {_STORE_DTYPE.__name__} vectors per the "
+                    f"Embedder protocol; got {computed.dtype}"
+                )
+
+            dim = int(computed.shape[1])
+            # Validate dim against the store's existing dim for this embedder_id
+            # BEFORE mutating any in-memory state, so a drift never leaves the
+            # cache half-appended.
+            self._check_live_dim(dim)
+
             for sha, vector in zip(miss_shas, computed, strict=True):
                 ref = len(self._vectors)
-                self._vectors.append(np.asarray(vector, dtype=np.float32))
+                self._vectors.append(np.asarray(vector, dtype=_STORE_DTYPE))
+                self._rows.append((self._embedder_id, sha))
                 self._index[(self._embedder_id, sha)] = ref
+            self._dims[self._embedder_id] = dim
             self._flush()
 
         return np.stack(
-            [self._vectors[self._index[(self._embedder_id, sha)]] for sha in shas],
+            [
+                self._vector_for(self._index[(self._embedder_id, sha)], sha)
+                for sha in shas
+            ],
             axis=0,
         )
 
