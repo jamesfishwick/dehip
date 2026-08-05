@@ -34,6 +34,11 @@ VALID_INVOCATIONS = {
 
 ALL_COMMANDS = sorted(cli.COMMANDS)
 
+# build-corpus is implemented (issue #5): it no longer emits a stub summary and
+# its real handler needs an API key, so the stub-behavior tests below run over
+# the remaining stubs. Flag-rejection (argparse, pre-handler) still covers all.
+STUB_COMMANDS = [c for c in ALL_COMMANDS if c != "build-corpus"]
+
 
 def _run_cli(argv):
     """Run the CLI as a subprocess so stdout/stderr are cleanly separated."""
@@ -74,7 +79,7 @@ def test_unknown_flag_rejected_with_exit_2(command):
     assert result.returncode == cli.EXIT_VALIDATION == 2
 
 
-@pytest.mark.parametrize("command", ALL_COMMANDS)
+@pytest.mark.parametrize("command", STUB_COMMANDS)
 def test_stdout_is_json_on_its_own(command):
     result = _run_cli(VALID_INVOCATIONS[command])
     assert result.returncode == cli.EXIT_SUCCESS == 0
@@ -86,7 +91,7 @@ def test_stdout_is_json_on_its_own(command):
     assert result.stderr.strip() != ""
 
 
-@pytest.mark.parametrize("command", ALL_COMMANDS)
+@pytest.mark.parametrize("command", STUB_COMMANDS)
 def test_seed_appears_in_summary(command):
     argv = ["--seed", "4242", *VALID_INVOCATIONS[command]]
     result = _run_cli(argv)
@@ -96,7 +101,8 @@ def test_seed_appears_in_summary(command):
 
 
 def test_default_seed_recorded():
-    summary = _run_json(["build-corpus"])
+    # build-corpus is no longer a stub (issue #5); use a remaining stub command.
+    summary = _run_json(["rewrite"])
     assert summary["seed"] == 0
 
 
