@@ -34,13 +34,14 @@ VALID_INVOCATIONS = {
 
 ALL_COMMANDS = sorted(cli.COMMANDS)
 
-# Commands still served by the shared stub. ``build-corpus`` (issue #5) and
-# ``score`` (issue #10) became real commands, so their handlers no longer emit
-# the {"status": "stub"} summary and are excluded from the stub-shape assertions
-# below (their behavior is covered by test_corpus.py and test_score_cli.py).
-# Flag-rejection (argparse, pre-handler) still covers every command. The rest
-# remain stubs until their own tickets.
-STUB_COMMANDS = sorted(set(cli.COMMANDS) - {"build-corpus", "score"})
+# Commands still served by the shared stub. ``build-corpus`` (issue #5),
+# ``score`` (issue #10), and ``self-check`` (issue #11) became real commands, so
+# their handlers no longer emit the {"status": "stub"} summary and are excluded
+# from the stub-shape assertions below (their behavior is covered by
+# test_corpus.py, test_score_cli.py, and test_self_check.py). Flag-rejection
+# (argparse, pre-handler) still covers every command. The rest remain stubs until
+# their own tickets.
+STUB_COMMANDS = sorted(set(cli.COMMANDS) - {"build-corpus", "score", "self-check"})
 
 def _run_cli(argv):
     """Run the CLI as a subprocess so stdout/stderr are cleanly separated."""
