@@ -493,6 +493,12 @@ def _run_recompute(args: argparse.Namespace, report_mod, Path) -> int:
         return EXIT_EXTERNAL_DEP
 
     judge_model = _verdicts_derived_judge_model(verdicts, args.judge)
+    # Best-effort corpus for the FR-010 gate: read the candidate manifest's
+    # homogeneous corpus tag when the manifest is a readable TextSet. A recompute
+    # run may point --candidate at a set id rather than a manifest path, in which
+    # case the tag is simply absent (None) and the set-id naming fallback still
+    # protects the gate; a bad manifest is never fatal to a recompute.
+    corpus = _best_effort_corpus(args.candidate)
     report = report_mod.assemble_report(
         report_id=Path(args.out).stem if args.out else "recompute",
         candidate_set=args.candidate,
@@ -506,8 +512,35 @@ def _run_recompute(args: argparse.Namespace, report_mod, Path) -> int:
         token_l2_result=None,
         jmq_scores=jmq_scores,
         verdicts=verdicts,
+        corpus=corpus,
     )
     return _emit_report(report, args.out, report_mod)
+
+
+def _best_effort_corpus(candidate_manifest: str | None) -> str | None:
+    """Read the candidate TextSet's corpus tag, or ``None`` if unavailable.
+
+    Used by the recompute path, where no MetricInputs is loaded, to still stamp
+    ``compared["corpus"]`` for the FR-010 gate. Any failure (the argument is a set
+    id not a path, the file is missing or not a valid TextSet) degrades to ``None``
+    -- the set-id naming fallback in the gate still applies -- and never aborts a
+    recompute over an otherwise-valid verdicts file.
+    """
+    if not candidate_manifest:
+        return None
+    try:
+        from pathlib import Path
+
+        from dehip.schemas import TextSet, read_json
+
+        path = Path(candidate_manifest)
+        if not path.is_file():
+            return None
+        text_set = read_json(path, TextSet)
+    except Exception:
+        return None
+    corpus = text_set.corpus
+    return corpus if isinstance(corpus, str) and corpus else None
 
 
 def _run_full_score(args: argparse.Namespace, report_mod, Path) -> int:

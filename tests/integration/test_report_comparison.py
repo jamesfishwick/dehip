@@ -19,7 +19,7 @@ import math
 from dehip import benchmark as benchmark_mod
 from dehip import cli
 from dehip import report as report_mod
-from dehip.schemas import MetricReport, read_json, write_json
+from dehip.schemas import MetricReport, TextSet, read_json, write_json
 
 # --- Fixtures ----------------------------------------------------------------
 
@@ -112,6 +112,58 @@ def test_delta_regression_marks_farther_from_human():
     assert deltas["jmq"]["improved"] is False  # went down, higher-is-better
 
 
+def test_zero_delta_renders_as_no_change_not_regression():
+    """IMPORTANT 1(a): an EXACTLY-zero delta is "no change", not a regression.
+
+    A metric that did not move (delta == 0) must not be rendered as "farther from
+    human" -- that would report a no-change as a false regression. The tri-state
+    ``status`` is "unchanged", ``improved`` is None (a no-change is not a
+    regression), and the rendered cell says "no change".
+    """
+    draft = _report("d", mmd=0.05, token_l2=0.005, jmq_overall=0.80)
+    # MMD identical (delta 0); the others move so the row still assembles.
+    rewrite = _report("r", mmd=0.05, token_l2=0.004, jmq_overall=0.85)
+
+    comparison = report_mod.assemble_comparison(
+        draft=draft, rewrites=[rewrite], comparison_id="c"
+    )
+    mmd_cell = comparison["rewrites"][0]["deltas"]["mmd"]
+    assert mmd_cell["delta"] == 0
+    assert mmd_cell["status"] == "unchanged"
+    assert mmd_cell["improved"] is None  # not folded into a regression
+    assert mmd_cell["comparable"] is True
+
+    rendered = report_mod.render_comparison(comparison)
+    # The rendered MMD row says "no change", never "farther from human".
+    mmd_row = next(ln for ln in rendered.splitlines() if ln.startswith("| mmd |"))
+    assert "no change" in mmd_row
+    assert "farther from human" not in mmd_row
+    assert "closer to human" not in mmd_row
+
+
+def test_rendered_arrow_direction_matches_improvement():
+    """IMPORTANT 1(b): the RENDERED arrow direction is asserted, not just the dict.
+
+    A JMQ gain must render "closer to human" and an MMD regression "farther from
+    human". Asserting the rendered markdown (not only the delta dict boolean)
+    means a flipped _fmt_delta ternary is caught here, where a dict-only assertion
+    would leave it green.
+    """
+    draft = _report("d", mmd=0.02, token_l2=0.005, jmq_overall=0.60)
+    # JMQ up (closer to human), MMD up (farther from human, lower-is-better).
+    rewrite = _report("r", mmd=0.09, token_l2=0.005, jmq_overall=0.90)
+
+    comparison = report_mod.assemble_comparison(
+        draft=draft, rewrites=[rewrite], comparison_id="c"
+    )
+    rendered = report_mod.render_comparison(comparison)
+    jmq_row = next(ln for ln in rendered.splitlines() if ln.startswith("| jmq |"))
+    mmd_row = next(ln for ln in rendered.splitlines() if ln.startswith("| mmd |"))
+    # A gain renders closer, a regression renders farther -- and never the reverse.
+    assert "closer to human" in jmq_row and "farther from human" not in jmq_row
+    assert "farther from human" in mmd_row and "closer to human" not in mmd_row
+
+
 # --- Null / un-run metric handling (never a silent 0 delta) ------------------
 
 
@@ -143,6 +195,30 @@ def test_null_jmq_when_no_overall_dimension():
     assert jmq_delta["draft"] is None
     assert jmq_delta["delta"] is None
     assert jmq_delta["comparable"] is False
+
+
+def test_null_on_draft_side_of_distance_metric_is_not_comparable():
+    """NIT 2(1): the DRAFT being null (rewrite present) is also not-comparable.
+
+    The either-side None guard must fire regardless of WHICH side is null. Here
+    the draft never ran token-L2 (NaN sentinel) while the rewrite has a value; the
+    delta must be None / not-comparable, never a silent 0. A mutation narrowing
+    the guard to only the rewrite side (dropping the draft-None branch) fails this.
+    """
+    draft = _report("d", mmd=0.05, token_l2=None, jmq_overall=0.80)
+    rewrite = _report("r", mmd=0.04, token_l2=0.004, jmq_overall=0.85)
+
+    comparison = report_mod.assemble_comparison(
+        draft=draft, rewrites=[rewrite], comparison_id="c"
+    )
+    token_delta = comparison["rewrites"][0]["deltas"]["token_l2"]
+    assert token_delta["draft"] is None
+    assert token_delta["rewrite"] == 0.004  # the present side is preserved
+    assert token_delta["delta"] is None
+    assert token_delta["improved"] is None
+    assert token_delta["comparable"] is False
+    # The comparable metrics on the same row still resolve.
+    assert comparison["rewrites"][0]["deltas"]["mmd"]["comparable"] is True
 
 
 # --- FR-010: personal-corpus benchmark refusal (BOTH directions) -------------
@@ -255,6 +331,29 @@ def test_trajectory_orders_by_round_from_mixed_input():
     assert report_ids == ["k1", "k2", "k3"]
 
 
+def test_trajectory_round_order_in_rendered_markdown():
+    """NIT 2(2): the RENDERED trajectory rows are in round order (k1, k2, k3).
+
+    Asserting the markdown row order (not only the JSON list) catches a rendering
+    path that iterates the trajectory in a different order than it was sorted.
+    """
+    draft = _report("d", mmd=0.10, token_l2=0.010, jmq_overall=0.60)
+    # Mixed input order; the rendered rows must still be k1 < k2 < k3.
+    k3 = _report("k3", mmd=0.03, token_l2=0.003, jmq_overall=0.90, round_no=3)
+    k1 = _report("k1", mmd=0.07, token_l2=0.007, jmq_overall=0.70, round_no=1)
+    k2 = _report("k2", mmd=0.05, token_l2=0.005, jmq_overall=0.80, round_no=2)
+
+    comparison = report_mod.assemble_comparison(
+        draft=draft, rewrites=[k3, k1, k2], comparison_id="c"
+    )
+    rendered = report_mod.render_comparison(comparison)
+    # Locate the trajectory table's data rows (round labels k1/k2/k3).
+    idx_k1 = rendered.index("| k1 |")
+    idx_k2 = rendered.index("| k2 |")
+    idx_k3 = rendered.index("| k3 |")
+    assert idx_k1 < idx_k2 < idx_k3
+
+
 def test_single_rewrite_has_no_trajectory():
     draft = _report("d", mmd=0.10, token_l2=0.010, jmq_overall=0.60)
     rewrite = _report("r", mmd=0.05, token_l2=0.005, jmq_overall=0.80, round_no=1)
@@ -262,6 +361,37 @@ def test_single_rewrite_has_no_trajectory():
         draft=draft, rewrites=[rewrite], comparison_id="c"
     )
     assert "trajectory" not in comparison
+
+
+def test_round_comes_from_compared_not_config_k():
+    """NIT 1: the round is read from compared["round"], never config["k"].
+
+    ``k`` is overloaded (the rewrite state machine's current-round index), so a
+    stray ``config["k"]`` must NOT be treated as the trajectory round. The primary
+    signal, ``compared["round"]``, still orders the trajectory; a config ``k`` of
+    a different meaning is ignored (round reads None on the ordering-only report).
+    """
+    draft = _report("d", mmd=0.10, token_l2=0.010, jmq_overall=0.60)
+    # compared["round"] present -> used. A misleading config["k"] is also stamped
+    # and must be ignored (would have flipped ordering if consulted).
+    k1 = _report("k1", mmd=0.07, token_l2=0.007, jmq_overall=0.70, round_no=1)
+    k1.config["k"] = 99
+    k2 = _report("k2", mmd=0.05, token_l2=0.005, jmq_overall=0.80, round_no=2)
+    k2.config["k"] = 0
+
+    comparison = report_mod.assemble_comparison(
+        draft=draft, rewrites=[k2, k1], comparison_id="c"
+    )
+    # Ordered by compared["round"] (1, 2), unaffected by the stray config["k"].
+    assert [row["round"] for row in comparison["trajectory"]] == [1, 2]
+    assert [row["report_id"] for row in comparison["trajectory"]] == ["k1", "k2"]
+
+    # A report with ONLY config["k"] (no compared/config round) reads round None,
+    # proving the k fallback was dropped.
+    only_k = _report("ok", mmd=0.04, token_l2=0.004, jmq_overall=0.88)
+    only_k.compared.pop("round", None)
+    only_k.config["k"] = 5
+    assert report_mod._report_round(only_k) is None
 
 
 # --- Benchmark rows + always-present external-protocol caveat -----------------
@@ -365,6 +495,48 @@ def test_cli_report_writes_json_and_md(tmp_path):
     assert "k-round trajectory" in md
 
 
+def test_cli_report_md_render_failure_leaves_neither_artifact(tmp_path, monkeypatch):
+    """IMPORTANT 3: a .md render/write failure leaves NEITHER .json nor .md.
+
+    _emit_comparison stages both artifacts to temp files and only commits once
+    BOTH stage successfully, mirroring _emit_report's all-or-nothing pair. When
+    render_comparison raises OSError after the .json temp is staged, the branch
+    must discard the staged .json, exit EXIT_IO (5), leave no orphaned .json, no
+    .md, and no .tmp debris.
+    """
+    draft = _write_report(
+        tmp_path / "draft.json",
+        _report("d", mmd=0.10, token_l2=0.010, jmq_overall=0.60),
+    )
+    rewrite = _write_report(
+        tmp_path / "r.json",
+        _report("r", mmd=0.05, token_l2=0.005, jmq_overall=0.80, round_no=1),
+    )
+
+    def _boom(_comparison):
+        raise OSError("simulated md render failure")
+
+    monkeypatch.setattr(report_mod, "render_comparison", _boom)
+
+    out = tmp_path / "cmp.json"
+    rc = cli.main(
+        [
+            "report",
+            "--draft-report",
+            draft,
+            "--rewrite-report",
+            rewrite,
+            "--out",
+            str(out),
+        ]
+    )
+    assert rc == cli.EXIT_IO
+    # All-or-nothing: neither final artifact exists, no temp debris.
+    assert not out.exists()
+    assert not (tmp_path / "cmp.md").exists()
+    assert not list(tmp_path.glob("*.tmp"))
+
+
 def test_cli_report_benchmark_refusal_exits_2(tmp_path):
     draft = _write_report(
         tmp_path / "draft.json",
@@ -449,3 +621,97 @@ def test_cli_report_round_trips_through_schema_reader(tmp_path):
     loaded = read_json(path, MetricReport)
     assert loaded.report_id == "d"
     assert report_mod.report_corpus(loaded) == "fineweb"
+
+
+# --- IMPORTANT 2(b): end-to-end wired corpus drives the FR-010 refusal --------
+
+
+class _StubTokenizer:
+    """Whitespace tokenizer stub for the token_l2 score path (no real model)."""
+
+    tokenizer_id = "stub-tokenizer"
+
+    def tokenize(self, text: str):
+        return text.split()
+
+
+def _score_personal_report(tmp_path, monkeypatch, name):
+    """Produce ONE report through the REAL score path over a personal corpus.
+
+    Builds candidate/reference TextSet manifests tagged ``corpus="personal"`` and
+    runs ``dehip score --metrics token_l2`` so the corpus is wired from the
+    manifest through MetricInputs -> score() -> compared["corpus"] the same way
+    production emits it -- no hand-stamped fixture. Returns the report path.
+    """
+    monkeypatch.setattr(
+        "dehip.metrics.token_l2.Qwen3Tokenizer", lambda *a, **k: _StubTokenizer()
+    )
+    pair_ids = [f"personal-{i}" for i in range(4)]
+    for role, tag, texts in (
+        ("instruct_draft", "cand", "model output"),
+        ("human_reference", "ref", "human reference"),
+    ):
+        manifest = TextSet(
+            set_id=f"{tag}-set",
+            role=role,
+            corpus="personal",
+            pair_ids=pair_ids,
+            provenance={"texts_path": f"{name}-{tag}.jsonl"},
+        )
+        write_json(manifest, tmp_path / f"{name}-{tag}.manifest.json")
+        with (tmp_path / f"{name}-{tag}.jsonl").open("w", encoding="utf-8") as fh:
+            for i, pid in enumerate(pair_ids):
+                fh.write(
+                    json.dumps({"pair_id": pid, "text": f"{texts} {i} words here"})
+                    + "\n"
+                )
+    out = tmp_path / f"{name}-report.json"
+    rc = cli.main(
+        [
+            "score",
+            "--candidate",
+            str(tmp_path / f"{name}-cand.manifest.json"),
+            "--reference",
+            str(tmp_path / f"{name}-ref.manifest.json"),
+            "--metrics",
+            "token_l2",
+            "--out",
+            str(out),
+        ]
+    )
+    assert rc == cli.EXIT_SUCCESS
+    return str(out)
+
+
+def test_cli_report_benchmark_refuses_on_wired_personal_corpus(tmp_path, monkeypatch):
+    """IMPORTANT 2(b): a report with ONLY the production-wired corpus tag refuses.
+
+    The FR-010 refusal must fire on the PRIMARY signal (compared["corpus"] wired
+    by the real score path), not merely the set-id naming fallback. Here the set
+    ids are ``cand-set``/``ref-set`` (no ``personal-`` prefix, so the fallback
+    does NOT fire); only the wired ``compared["corpus"] == "personal"`` can catch
+    it. --benchmark over such a report must exit EXIT_VALIDATION with no artifact.
+    """
+    draft = _score_personal_report(tmp_path, monkeypatch, "draft")
+    # Confirm the primary signal is present and the fallback is NOT the trigger.
+    loaded = read_json(draft, MetricReport)
+    assert loaded.compared["corpus"] == "personal"
+    assert not loaded.compared["candidate_set"].startswith("personal-")
+    rewrite = _score_personal_report(tmp_path, monkeypatch, "rw")
+
+    out = tmp_path / "cmp.json"
+    rc = cli.main(
+        [
+            "report",
+            "--draft-report",
+            draft,
+            "--rewrite-report",
+            rewrite,
+            "--benchmark",
+            "--out",
+            str(out),
+        ]
+    )
+    assert rc == cli.EXIT_VALIDATION
+    assert not out.exists()
+    assert not (tmp_path / "cmp.md").exists()
