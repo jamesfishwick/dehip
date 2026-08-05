@@ -56,6 +56,7 @@ __all__ = [
     "build_caveats",
     "render_markdown",
     "load_scoring_inputs",
+    "report_to_jsonable",
 ]
 
 # Documented small-N floor for the caveat. Distinct from validate's DEFAULT_MIN_N
@@ -137,6 +138,32 @@ def _texts_path_for(manifest_path: Path, provenance: dict[str, Any]) -> Path:
     return manifest_path.parent / f"{stem}.jsonl"
 
 
+def _assert_ids_match(
+    left_name: str,
+    left_ids: Sequence[str],
+    right_name: str,
+    right_ids: Sequence[str],
+) -> None:
+    """Raise :class:`InputSetValidationError` unless the two id sets are identical.
+
+    Reports the asymmetric difference (only-in-left / only-in-right) so a
+    hand-broken or mis-pointed manifest is pinpointed, not merely rejected. Runs
+    before any scoring spend so a mismatched reference is caught at load time
+    (exit 2), never as a later KeyError while embedding or judging.
+    """
+    from dehip.validate import InputSetValidationError
+
+    left_set, right_set = set(left_ids), set(right_ids)
+    if left_set != right_set:
+        only_left = sorted(left_set - right_set)
+        only_right = sorted(right_set - left_set)
+        raise InputSetValidationError(
+            f"pair_id mismatch between {left_name} and {right_name}; "
+            f"only in {left_name}: {only_left}; "
+            f"only in {right_name}: {only_right}"
+        )
+
+
 def load_scoring_inputs(
     candidate_manifest: str,
     reference_manifest: str,
@@ -149,6 +176,13 @@ def load_scoring_inputs(
     data-model.md, TextSet). Prompts (needed only by JMQ) come from
     ``prompts_path`` (a ``{pair_id, prompt}`` or corpus ``{pair_id, prompt, ...}``
     JSONL); when omitted, JMQ cannot run.
+
+    Both manifests' ``pair_ids`` are read and cross-validated here (FR-009):
+    the candidate ids, the reference ids, and each side's texts-file keys must
+    all name the same set. A reference whose ids diverge from the candidate, or a
+    texts file that is a superset (or subset) of its manifest, is rejected with
+    :class:`~dehip.validate.InputSetValidationError` (exit 2) *before* any
+    embedder or judge is touched -- never surfacing later as a KeyError.
 
     Returns the inputs plus the two ``set_id`` strings for the report identity.
     """
@@ -166,6 +200,21 @@ def load_scoring_inputs(
         _texts_path_for(ref_path, ref_set.provenance)
     )
 
+    # Cross-validate all four id sources before any spend: candidate manifest ==
+    # reference manifest, and each manifest == its own texts-file keys. This is
+    # the real pairing gate; score() no longer needs a separate one. Checking the
+    # texts keys exactly (not just membership) rejects a texts file that is a
+    # superset of the manifest, so a subset is never silently scored.
+    cand_ids = list(cand_set.pair_ids)
+    ref_ids = list(ref_set.pair_ids)
+    _assert_ids_match("candidate", cand_ids, "reference", ref_ids)
+    _assert_ids_match(
+        "candidate manifest", cand_ids, "candidate texts", candidate_texts.keys()
+    )
+    _assert_ids_match(
+        "reference manifest", ref_ids, "reference texts", reference_texts.keys()
+    )
+
     prompts: dict[str, str] | None = None
     if prompts_path is not None:
         prompts = {}
@@ -179,7 +228,7 @@ def load_scoring_inputs(
 
     return (
         MetricInputs(
-            pair_ids=list(cand_set.pair_ids),
+            pair_ids=cand_ids,
             candidate_texts=candidate_texts,
             reference_texts=reference_texts,
             prompts=prompts,
@@ -526,11 +575,23 @@ def score(
     """
     selected = _parse_metrics(metrics)
 
-    # Validation before any scoring spend (FR-009). The shared pairing/count/min-N
-    # gates run through validate_input_sets; the per-side length gate is checked
-    # explicitly here since candidate and reference carry independent text maps.
+    # Validation before any scoring spend (FR-009). The candidate and reference
+    # text maps are validated against the shared pair_ids independently: their
+    # key sets must each equal pair_ids (so neither a missing nor an extra id
+    # slips through) and every referenced text must be non-empty. Passing the
+    # candidate keys as candidate and the reference keys as reference -- not the
+    # same list twice -- means a mismatched side is actually caught here, not
+    # later as a KeyError while embedding or judging.
     pair_ids = list(inputs.pair_ids)
-    validate_input_sets(pair_ids, pair_ids, texts=None, min_n=min_n)
+    validate_input_sets(
+        list(inputs.candidate_texts.keys()),
+        list(inputs.reference_texts.keys()),
+        texts=None,
+        min_n=min_n,
+    )
+    _assert_ids_match(
+        "pair_ids", pair_ids, "candidate texts", inputs.candidate_texts.keys()
+    )
     for side_name, side in (
         ("candidate", inputs.candidate_texts),
         ("reference", inputs.reference_texts),
@@ -596,6 +657,43 @@ def score(
         thresholds=thresholds,
         started=started,
     )
+
+
+# --- JSON serialization boundary ---------------------------------------------
+
+
+def _sanitize_nan(value: Any) -> Any:
+    """Recursively replace ``NaN`` floats with ``None`` for strict-JSON output.
+
+    Bare ``NaN`` is invalid per ECMA-404: ``JSON.parse`` and Go's ``encoding/json``
+    reject it, and ``json.loads(..., parse_constant=...)`` or a strict parser will
+    trip on it. The in-memory :class:`~dehip.schemas.MetricReport` keeps ``NaN``
+    for an un-run ``mmd``/``token_l2`` (so ``np.isnan`` stays meaningful and an
+    un-run metric is never confused with a real ``0.0``); this converts that
+    sentinel to JSON ``null`` only at the serialization boundary, leaving ``0.0``
+    untouched so the two remain distinguishable on disk.
+    """
+    if isinstance(value, float):
+        return None if value != value else value  # value != value is True for NaN
+    if isinstance(value, dict):
+        return {k: _sanitize_nan(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_nan(v) for v in value]
+    if isinstance(value, tuple):
+        return [_sanitize_nan(v) for v in value]
+    return value
+
+
+def report_to_jsonable(report: MetricReport) -> dict[str, Any]:
+    """Turn a :class:`MetricReport` into a strict-JSON-safe dict.
+
+    ``asdict`` then :func:`_sanitize_nan`, so an un-run metric's ``NaN`` becomes
+    ``null`` while a real ``0.0`` stays ``0.0``. Use this at every write boundary
+    (file and stdout) instead of a bare ``asdict`` so nothing emits bare ``NaN``.
+    """
+    from dataclasses import asdict
+
+    return _sanitize_nan(asdict(report))
 
 
 # --- Rendering ---------------------------------------------------------------

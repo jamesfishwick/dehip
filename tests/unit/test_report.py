@@ -16,6 +16,8 @@ suite locks the composition contract the adversarial review will probe:
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -29,9 +31,10 @@ from dehip.report import (
     order_distribution,
     recompute_jmq,
     render_markdown,
+    report_to_jsonable,
     score,
 )
-from dehip.schemas import JudgeVerdict
+from dehip.schemas import JudgeVerdict, MetricReport, read_json, write_json
 from dehip.validate import InputSetValidationError
 
 # --- Stubs -------------------------------------------------------------------
@@ -488,3 +491,173 @@ def test_render_markdown_includes_config_metrics_and_caveats(tmp_path):
     assert "small_n" in md
     assert "mmd_bandwidth_comparability" in md
     assert "non_default_judge" in md
+
+
+# --- IMPORTANT 1: NaN sanitized to null at the JSON boundary ------------------
+
+
+def test_report_to_jsonable_maps_nan_to_null_keeps_zero():
+    """An un-run metric's NaN becomes null; a real 0.0 stays 0.0 and distinguishable."""
+    report = assemble_report(
+        report_id="r",
+        candidate_set="c",
+        reference_set="ref",
+        n=50,
+        seed=0,
+        judge_model=DEFAULT_JUDGE_MODEL,
+        embedder_id="e",
+        tokenizer_id=None,
+        mmd_result=None,  # un-run -> NaN in memory
+        token_l2_result=None,  # un-run -> NaN in memory
+        jmq_scores=None,
+        verdicts=None,
+    )
+    # In memory the sentinel is still NaN (existing np.isnan tests stay valid).
+    assert np.isnan(report.mmd)
+    jsonable = report_to_jsonable(report)
+    # At the boundary, un-run metrics are null, not NaN.
+    assert jsonable["mmd"] is None
+    assert jsonable["token_l2"] is None
+    # Strict JSON: no bare NaN token survives; parse_constant rejects NaN/Infinity.
+    text = json.dumps(jsonable)
+    assert "NaN" not in text
+
+    def _reject(_c):
+        raise AssertionError("non-strict JSON constant present")
+
+    round_tripped = json.loads(text, parse_constant=_reject)
+    assert round_tripped["mmd"] is None
+
+
+def test_report_to_jsonable_preserves_real_zero():
+    """A real 0.0 metric (identical sets) is preserved, never collapsed to null."""
+
+    class _Zero:
+        mmd2 = 0.0
+        distance = 0.0
+        bandwidth = 1.0
+
+    report = assemble_report(
+        report_id="r",
+        candidate_set="c",
+        reference_set="ref",
+        n=50,
+        seed=0,
+        judge_model=DEFAULT_JUDGE_MODEL,
+        embedder_id="e",
+        tokenizer_id="t",
+        mmd_result=_Zero(),
+        token_l2_result=_Zero(),
+        jmq_scores=None,
+        verdicts=None,
+    )
+    jsonable = report_to_jsonable(report)
+    assert jsonable["mmd"] == 0.0
+    assert jsonable["mmd"] is not None
+    assert jsonable["token_l2"] == 0.0
+
+
+# --- NIT 2: invalid-verdict path, seed-driven bias, JSON round-trip -----------
+
+
+def test_score_counts_and_excludes_invalid_verdicts(tmp_path):
+    """An invalid judge reply is excluded-and-counted: invalid>0, out of the win rate.
+
+    A judge that returns a non-letter drives every verdict to choice='invalid'.
+    That must surface as jmq[dim]['invalid'] > 0 and be excluded from wins/losses
+    (n == 0), never scored as a win.
+    """
+    inputs = _inputs(4)
+    report = score(
+        inputs,
+        report_id="r",
+        candidate_set="c",
+        reference_set="ref",
+        judge_client=ScriptedJudge("not-a-letter"),
+        verdicts_path=str(tmp_path / "v.jsonl"),
+        metrics="jmq",
+        seed=2,
+    )
+    for dimension in DIMENSION_ORDER:
+        row = report.jmq[dimension]
+        assert row["invalid"] == 4  # all four pairs invalid on every dimension
+        assert row["wins"] == 0
+        assert row["losses"] == 0
+        assert row["n"] == 0  # excluded from the valid comparison count
+        assert row["score"] is None  # no valid verdicts -> no win rate scored
+
+
+def test_render_markdown_invalid_column_nonzero(tmp_path):
+    """The rendered JMQ table's Invalid column reflects the excluded verdicts."""
+    inputs = _inputs(3)
+    report = score(
+        inputs,
+        report_id="r",
+        candidate_set="c",
+        reference_set="ref",
+        judge_client=ScriptedJudge("???"),
+        verdicts_path=str(tmp_path / "v.jsonl"),
+        metrics="jmq",
+        seed=4,
+    )
+    md = render_markdown(report)
+    # The 'overall' row shows Invalid=3 (all three pairs invalid).
+    assert "| overall |" in md
+    overall_line = next(li for li in md.splitlines() if li.startswith("| overall |"))
+    # Columns: | dim | score | wins | losses | invalid | n |
+    cells = [c.strip() for c in overall_line.strip("|").split("|")]
+    assert cells[4] == "3"  # invalid column
+
+
+def test_bias_audit_unchanged_when_judge_varies_at_fixed_seed(tmp_path):
+    """Vary the judge at a FIXED seed: the bias-audit distribution is identical.
+
+    Proves the A/B order distribution comes from the seed and pair_ids, not from
+    the judge's output. A judge answering all 'A' and one answering all 'B' at
+    the same seed yield the same model_first/human_first split.
+    """
+    inputs = _inputs(10)
+
+    def run(reply, subdir):
+        (tmp_path / subdir).mkdir()
+        return score(
+            inputs,
+            report_id="r",
+            candidate_set="c",
+            reference_set="ref",
+            judge_client=ScriptedJudge(reply),
+            verdicts_path=str(tmp_path / subdir / "v.jsonl"),
+            metrics="jmq",
+            seed=77,
+        ).jmq["bias_audit"]
+
+    audit_a = run("A", "judge_a")
+    audit_b = run("B", "judge_b")
+    assert audit_a == audit_b
+
+
+def test_emitted_report_round_trips_through_read_json(tmp_path):
+    """Round-trip the emitted JSON through read_json(MetricReport).
+
+    Catches a renamed or extra field: _from_dict rejects unknown keys and a
+    missing schema_version, so a drift in the emitted shape fails loudly here.
+    """
+    inputs = _inputs(4)
+    report = score(
+        inputs,
+        report_id="rt",
+        candidate_set="c",
+        reference_set="ref",
+        embed_cache=_cache(tmp_path),
+        tokenizer=StubTokenizer(),
+        judge_client=ScriptedJudge("A"),
+        verdicts_path=str(tmp_path / "v.jsonl"),
+        seed=8,
+    )
+    path = tmp_path / "report.json"
+    write_json(report, path)
+    restored = read_json(path, MetricReport)
+    assert isinstance(restored, MetricReport)
+    assert restored.report_id == "rt"
+    assert restored.config["seed"] == 8
+    assert restored.jmq["overall"]["n"] == 4

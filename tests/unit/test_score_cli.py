@@ -169,8 +169,212 @@ def test_cli_metric_subset(tmp_path, monkeypatch):
     assert rc == cli.EXIT_SUCCESS
     written = json.loads(out.read_text())
     assert not np.isnan(written["token_l2"])
-    assert np.isnan(written["mmd"])
+    # IMPORTANT 1: an un-run metric serializes to strict-JSON null, not bare NaN.
+    assert written["mmd"] is None
     assert written["jmq"] == {}
+
+
+def test_cli_written_json_is_strict_and_unrun_is_null(tmp_path, monkeypatch):
+    """IMPORTANT 1: on-disk JSON re-parses under strict json.loads; un-run mmd is null.
+
+    A --metrics token_l2 run leaves mmd un-run. The file must be valid ECMA-404
+    JSON (no bare NaN that JSON.parse / Go would reject), and the un-run mmd must
+    read back as null -- not 0.0 (would be misread as identical sets) and not the
+    string 'NaN'. token_l2 (which ran) keeps its real numeric value.
+    """
+    cand, ref, _ = _corpus(tmp_path, 4)
+    _patch_seams(monkeypatch)
+    out = tmp_path / "strict.json"
+    rc = cli.main(
+        [
+            "score",
+            "--candidate",
+            cand,
+            "--reference",
+            ref,
+            "--metrics",
+            "token_l2",
+            "--out",
+            str(out),
+        ]
+    )
+    assert rc == cli.EXIT_SUCCESS
+
+    raw = out.read_text()
+    assert "NaN" not in raw  # no bare NaN token anywhere on disk
+
+    # Strict parse: reject the non-standard NaN/Infinity constants outright.
+    def _reject(_const):
+        raise AssertionError("non-strict JSON constant present")
+
+    written = json.loads(raw, parse_constant=_reject)
+    assert written["mmd"] is None  # un-run -> null, not 0.0, not 'NaN'
+    assert written["mmd"] != 0.0
+    assert isinstance(written["token_l2"], float)  # ran -> a real number
+
+
+# --- IMPORTANT 2: cost estimate threaded into config + --yes gate ------------
+
+
+def _force_low_threshold(monkeypatch):
+    """Make cost_preflight gate at a threshold any real run exceeds.
+
+    Wraps the real cost_preflight with threshold_usd=0.0 so the gate fires unless
+    --yes is given, exercising the confirmation path without needing thousands of
+    pairs.
+    """
+    import functools
+
+    from dehip.metrics import jmq as jmq_mod
+
+    real = jmq_mod.cost_preflight
+    patched = functools.partial(real, threshold_usd=0.0)
+    monkeypatch.setattr("dehip.metrics.jmq.cost_preflight", patched)
+
+
+def test_cli_cost_gate_blocks_without_yes_no_judge_calls(tmp_path, monkeypatch):
+    """Above threshold without --yes -> exit 2 and ZERO judge calls."""
+    cand, ref, prompts = _corpus(tmp_path, 4)
+    embedder, judge = _patch_seams(monkeypatch)
+    _force_low_threshold(monkeypatch)
+
+    rc = cli.main(
+        [
+            "score",
+            "--candidate",
+            cand,
+            "--reference",
+            ref,
+            "--prompts",
+            prompts,
+            "--metrics",
+            "jmq",
+            "--out",
+            str(tmp_path / "r.json"),
+            # no --yes
+        ]
+    )
+    assert rc == cli.EXIT_VALIDATION
+    assert judge.calls == 0  # the gate blocked before any spend
+
+
+def test_cli_cost_estimate_recorded_in_config(tmp_path, monkeypatch):
+    """With --yes, the cost estimate/threshold lands in report config.thresholds."""
+    cand, ref, prompts = _corpus(tmp_path, 4)
+    _patch_seams(monkeypatch)
+    _force_low_threshold(monkeypatch)
+    out = tmp_path / "r.json"
+
+    rc = cli.main(
+        [
+            "score",
+            "--candidate",
+            cand,
+            "--reference",
+            ref,
+            "--prompts",
+            prompts,
+            "--metrics",
+            "jmq",
+            "--out",
+            str(out),
+            "--yes",
+        ]
+    )
+    assert rc == cli.EXIT_SUCCESS
+    written = json.loads(out.read_text())
+    thresholds = written["config"]["thresholds"]
+    # The estimate dict cost_preflight returned is threaded through, not discarded.
+    assert thresholds["calls"] == 4 * len(DIMENSION_ORDER)
+    assert "estimated_usd" in thresholds
+    assert "threshold_usd" in thresholds
+
+
+# --- IMPORTANT 3: recompute derives judge_model from the verdict rows ---------
+
+
+def test_cli_recompute_derives_judge_model_and_caveat(tmp_path):
+    """Recompute stamps the verdicts' actual judge_model, not the CLI default.
+
+    Verdicts written with a non-default judge_model must drive
+    report.config.judge_model AND fire the non-default-judge caveat, rather than
+    the default gpt-5.4-mini the CLI would otherwise pass.
+    """
+    from dehip.metrics.jmq import JudgePair, run_judging
+
+    pairs = [
+        JudgePair(pair_id=f"fineweb-{i}", prompt="p", model_text="m", human_text="h")
+        for i in range(3)
+    ]
+    verdicts_path = tmp_path / "verdicts.jsonl"
+
+    class _NamedJudge:
+        def judge(self, rendered_prompt, *, model):
+            return "A"
+
+    # run_judging stamps model= into each verdict row.
+    run_judging(
+        pairs, verdicts_path, client=_NamedJudge(), seed=1, model="claude-experiment"
+    )
+
+    out = tmp_path / "recomputed.json"
+    rc = cli.main(
+        [
+            "score",
+            "--candidate",
+            "cand-set",
+            "--reference",
+            "ref-set",
+            "--judge",
+            "gpt-5.4-mini",  # the CLI default, which must NOT win
+            "--recompute-jmq-from",
+            str(verdicts_path),
+            "--out",
+            str(out),
+        ]
+    )
+    assert rc == cli.EXIT_SUCCESS
+    written = json.loads(out.read_text())
+    # config.judge_model reflects the verdict rows, not the --judge default.
+    assert written["config"]["judge_model"] == "claude-experiment"
+    # And the non-default-judge caveat fires off the derived value.
+    kinds = {c["kind"] for c in written["caveats"]}
+    assert "non_default_judge" in kinds
+
+
+# --- IMPORTANT 4: atomic + guarded report write ------------------------------
+
+
+def test_cli_unwritable_report_path_exits_io(tmp_path, monkeypatch):
+    """A write to an unwritable path fails loudly with EXIT_IO, no half file.
+
+    The report json target lives under a path whose parent is a regular file, so
+    mkdir/write raises OSError. That must map to a clear non-zero exit, not a
+    bare exit-1 traceback with a half-written artifact.
+    """
+    cand, ref, _ = _corpus(tmp_path, 4)
+    _patch_seams(monkeypatch)
+    # Make a file where a directory is needed, so writing under it raises OSError.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("i am a file", encoding="utf-8")
+    out = blocker / "report.json"  # blocker is a file, not a dir
+
+    rc = cli.main(
+        [
+            "score",
+            "--candidate",
+            cand,
+            "--reference",
+            ref,
+            "--metrics",
+            "token_l2",
+            "--out",
+            str(out),
+        ]
+    )
+    assert rc == cli.EXIT_IO
+    # No half-written report exists.
+    assert not out.exists()
 
 
 # --- Recompute path: zero judge calls, through CLI dispatch ------------------
@@ -228,6 +432,100 @@ def test_cli_recompute_jmq_no_judge_calls(tmp_path, monkeypatch):
         assert written["jmq"][dimension] == direct[dimension]
 
 
+# --- CRITICAL 1: pairing gate catches a mismatched reference before spend -----
+
+
+def test_cli_mismatched_reference_exits_validation_no_spend(tmp_path, monkeypatch):
+    """A reference manifest whose ids differ from the candidate -> exit 2, no spend.
+
+    The pairing gate must fire at load time (before any embedder or judge is
+    constructed or called), listing the asymmetric difference, rather than
+    surfacing later as a KeyError. Asserts zero embedder and judge calls.
+    """
+    pair_ids = [f"fineweb-{i}" for i in range(4)]
+    cand_texts = {pid: f"model output {i} words here" for i, pid in enumerate(pair_ids)}
+    cand = _write_manifest(
+        tmp_path, "cand", "cand-set", "instruct_draft", pair_ids, cand_texts
+    )
+    # Reference covers every candidate id AND carries an extra (fineweb-99). The
+    # old tautology (validate pair_ids against itself, pair_ids taken from the
+    # candidate only) would find non-empty reference text for all four candidate
+    # ids and silently score a subset. The real pairing gate rejects the
+    # asymmetric difference before any spend.
+    ref_ids = pair_ids + ["fineweb-99"]
+    ref_texts = {pid: f"human ref {i} words here" for i, pid in enumerate(ref_ids)}
+    ref = _write_manifest(
+        tmp_path, "ref", "ref-set", "human_reference", ref_ids, ref_texts
+    )
+
+    embedder, judge = _patch_seams(monkeypatch)
+    rc = cli.main(
+        [
+            "score",
+            "--candidate",
+            cand,
+            "--reference",
+            ref,
+            "--metrics",
+            "mmd",
+            "--out",
+            str(tmp_path / "r.json"),
+        ]
+    )
+    assert rc == cli.EXIT_VALIDATION
+    # Validation fired before any spend: nothing embedded, nothing judged.
+    assert embedder.call_count == 0
+    assert judge.calls == 0
+    # No report was written (validation aborted before emit).
+    assert not (tmp_path / "r.json").exists()
+
+
+def test_cli_texts_superset_of_manifest_not_scored(tmp_path, monkeypatch):
+    """A texts file that is a superset of the manifest must not silently score a subset.
+
+    The manifest names 3 ids; the texts JSONL carries 4 (an extra id). Scoring
+    the 3-id subset silently would hide a data-prep bug, so the exact-key check
+    rejects it with exit 2 and no spend.
+    """
+    manifest_ids = [f"fineweb-{i}" for i in range(3)]
+    texts_ids = manifest_ids + ["fineweb-extra"]
+    cand_texts = {pid: f"model {i} words here" for i, pid in enumerate(texts_ids)}
+    ref_texts = {pid: f"human {i} words here" for i, pid in enumerate(texts_ids)}
+
+    # Candidate: manifest lists 3 ids but the sibling JSONL holds 4 (superset).
+    cand_manifest = TextSet(
+        set_id="cand-set",
+        role="instruct_draft",
+        corpus="fineweb",
+        pair_ids=manifest_ids,
+        provenance={"texts_path": "cand.jsonl"},
+    )
+    write_json(cand_manifest, tmp_path / "cand.manifest.json")
+    with (tmp_path / "cand.jsonl").open("w", encoding="utf-8") as fh:
+        for pid in texts_ids:  # 4 rows, one more than the manifest
+            fh.write(json.dumps({"pair_id": pid, "text": cand_texts[pid]}) + "\n")
+
+    ref = _write_manifest(
+        tmp_path, "ref", "ref-set", "human_reference", manifest_ids, ref_texts
+    )
+
+    embedder, judge = _patch_seams(monkeypatch)
+    rc = cli.main(
+        [
+            "score",
+            "--candidate",
+            str(tmp_path / "cand.manifest.json"),
+            "--reference",
+            ref,
+            "--metrics",
+            "mmd",
+        ]
+    )
+    assert rc == cli.EXIT_VALIDATION
+    assert embedder.call_count == 0
+    assert judge.calls == 0
+
+
 def test_cli_missing_input_exits_validation(tmp_path, monkeypatch):
     _patch_seams(monkeypatch)
     rc = cli.main(
@@ -239,6 +537,113 @@ def test_cli_missing_input_exits_validation(tmp_path, monkeypatch):
             str(tmp_path / "also-nope.manifest.json"),
             "--metrics",
             "token_l2",
+        ]
+    )
+    assert rc == cli.EXIT_VALIDATION
+
+
+# --- CRITICAL 2: exit-code integrity for external-dep and data failures --------
+
+
+def test_cli_missing_openai_key_jmq_exits_external_dep(tmp_path, monkeypatch):
+    """(a) A jmq run with no OPENAI_API_KEY -> exit 3 (external dependency).
+
+    The judge client is NOT stubbed here: the real OpenAIJudgeClient() is
+    constructed, which raises openai.OpenAIError when the key is absent. That
+    must map to EXIT_EXTERNAL_DEP with a message, not a bare exit-1 traceback.
+    Inputs are well-formed so validation passes and the code actually reaches
+    judge construction.
+    """
+    cand, ref, prompts = _corpus(tmp_path, 4)
+    # Stub only the embedder (not needed for a jmq-only run, but harmless); leave
+    # the judge real so its keyless construction is exercised.
+    monkeypatch.setattr(
+        "dehip.metrics.embeddings.TransformersEmbedder", lambda *a, **k: StubEmbedder()
+    )
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    rc = cli.main(
+        [
+            "score",
+            "--candidate",
+            cand,
+            "--reference",
+            ref,
+            "--prompts",
+            prompts,
+            "--metrics",
+            "jmq",
+            "--out",
+            str(tmp_path / "r.json"),
+            "--yes",
+        ]
+    )
+    assert rc == cli.EXIT_EXTERNAL_DEP
+
+
+def test_cli_bad_input_beats_missing_key(tmp_path, monkeypatch):
+    """Bad input on a keyless machine reports exit 2 (bad input), not exit 3.
+
+    Because the judge is constructed lazily AFTER validation, a mismatched
+    reference is caught first: the missing key never gets a chance to raise.
+    """
+    pair_ids = [f"fineweb-{i}" for i in range(4)]
+    cand_texts = {pid: f"model {i} words here" for i, pid in enumerate(pair_ids)}
+    cand = _write_manifest(
+        tmp_path, "cand", "cand-set", "instruct_draft", pair_ids, cand_texts
+    )
+    ref_ids = pair_ids[:3] + ["fineweb-99"]
+    ref_texts = {pid: f"human {i} words here" for i, pid in enumerate(ref_ids)}
+    ref = _write_manifest(
+        tmp_path, "ref", "ref-set", "human_reference", ref_ids, ref_texts
+    )
+    prompts_path = tmp_path / "prompts.jsonl"
+    with prompts_path.open("w", encoding="utf-8") as fh:
+        for pid in pair_ids:
+            fh.write(json.dumps({"pair_id": pid, "prompt": "p"}) + "\n")
+
+    monkeypatch.setattr(
+        "dehip.metrics.embeddings.TransformersEmbedder", lambda *a, **k: StubEmbedder()
+    )
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    rc = cli.main(
+        [
+            "score",
+            "--candidate",
+            cand,
+            "--reference",
+            ref,
+            "--prompts",
+            str(prompts_path),
+            "--metrics",
+            "jmq",
+            "--yes",
+        ]
+    )
+    assert rc == cli.EXIT_VALIDATION
+
+
+def test_cli_corrupt_verdicts_recompute_exits_validation(tmp_path):
+    """(b) A corrupt verdicts.jsonl on --recompute-jmq-from -> exit 2 (not 1).
+
+    A truncated / non-JSON line is an input/data failure and must map to
+    EXIT_VALIDATION, never escape as a bare exit-1 traceback.
+    """
+    verdicts = tmp_path / "verdicts.jsonl"
+    verdicts.write_text('{"pair_id": "p0", "dimension": "overall",\n', encoding="utf-8")
+
+    rc = cli.main(
+        [
+            "score",
+            "--candidate",
+            "cand-set",
+            "--reference",
+            "ref-set",
+            "--recompute-jmq-from",
+            str(verdicts),
+            "--out",
+            str(tmp_path / "r.json"),
         ]
     )
     assert rc == cli.EXIT_VALIDATION
