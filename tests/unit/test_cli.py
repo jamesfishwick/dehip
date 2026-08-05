@@ -34,6 +34,12 @@ VALID_INVOCATIONS = {
 
 ALL_COMMANDS = sorted(cli.COMMANDS)
 
+# Commands still served by the shared stub. ``score`` became a real command in
+# issue #10, so its handler no longer emits the {"status": "stub"} summary and
+# is excluded from the stub-shape assertions below (its behavior is covered by
+# test_score_cli.py). Every other command remains a stub until its own ticket.
+STUB_COMMANDS = sorted(set(cli.COMMANDS) - {"score"})
+
 
 def _run_cli(argv):
     """Run the CLI as a subprocess so stdout/stderr are cleanly separated."""
@@ -74,7 +80,7 @@ def test_unknown_flag_rejected_with_exit_2(command):
     assert result.returncode == cli.EXIT_VALIDATION == 2
 
 
-@pytest.mark.parametrize("command", ALL_COMMANDS)
+@pytest.mark.parametrize("command", STUB_COMMANDS)
 def test_stdout_is_json_on_its_own(command):
     result = _run_cli(VALID_INVOCATIONS[command])
     assert result.returncode == cli.EXIT_SUCCESS == 0
@@ -86,7 +92,7 @@ def test_stdout_is_json_on_its_own(command):
     assert result.stderr.strip() != ""
 
 
-@pytest.mark.parametrize("command", ALL_COMMANDS)
+@pytest.mark.parametrize("command", STUB_COMMANDS)
 def test_seed_appears_in_summary(command):
     argv = ["--seed", "4242", *VALID_INVOCATIONS[command]]
     result = _run_cli(argv)

@@ -115,6 +115,119 @@ def _add_rewrite(subparsers: argparse._SubParsersAction) -> None:
     parser.set_defaults(func=lambda a: _run_stub("rewrite", a))
 
 
+def _run_score(args: argparse.Namespace) -> int:
+    """Real `dehip score` handler (issue #10): compose the metrics into a report.
+
+    Localized to this command. Imports of dehip.report and the metric seams are
+    done here (not at module top) so the other stub subcommands stay import-cheap
+    and the change stays contained to the score path.
+    """
+    from pathlib import Path
+
+    from dehip import report as report_mod
+    from dehip.metrics.embeddings import EmbeddingCache, TransformersEmbedder
+    from dehip.metrics.jmq import OpenAIJudgeClient, cost_preflight
+    from dehip.validate import InputSetValidationError
+
+    # Recompute path (FR-008): re-aggregate JMQ from persisted verdicts with no
+    # judge/API calls, then re-emit a report. No validation spend, no embedder.
+    if args.recompute_jmq_from:
+        _progress(f"dehip score: recomputing JMQ from {args.recompute_jmq_from}")
+        jmq_scores, verdicts = report_mod.recompute_jmq(args.recompute_jmq_from)
+        report = report_mod.assemble_report(
+            report_id=Path(args.out).stem if args.out else "recompute",
+            candidate_set=args.candidate,
+            reference_set=args.reference,
+            n=len({v.pair_id for v in verdicts}),
+            seed=args.seed,
+            judge_model=args.judge,
+            embedder_id=args.embedder,
+            tokenizer_id=None,
+            mmd_result=None,
+            token_l2_result=None,
+            jmq_scores=jmq_scores,
+            verdicts=verdicts,
+        )
+        _emit_report(report, args.out, report_mod)
+        return EXIT_SUCCESS
+
+    try:
+        inputs, cand_set_id, ref_set_id = report_mod.load_scoring_inputs(
+            args.candidate, args.reference, prompts_path=args.prompts
+        )
+    except (OSError, ValueError, KeyError) as exc:
+        _progress(f"dehip score: could not load input sets: {exc}")
+        return EXIT_VALIDATION
+
+    selected = [m.strip() for m in args.metrics.split(",") if m.strip()]
+
+    # JMQ cost preflight before any spend (FR-009). Gated on --yes.
+    if "jmq" in selected:
+        try:
+            cost_preflight(
+                len(inputs.pair_ids), confirm=args.yes, printer=_progress
+            )
+        except Exception as exc:  # CostThresholdError and friends -> validation exit
+            _progress(f"dehip score: {exc}")
+            return EXIT_VALIDATION
+
+    # Build the seams. The embedder and judge are lazy, so constructing them here
+    # costs nothing until a metric actually calls them.
+    embed_cache = None
+    if "mmd" in selected:
+        embedder = TransformersEmbedder(args.embedder)
+        embed_cache = EmbeddingCache(embedder)
+
+    judge_client = OpenAIJudgeClient() if "jmq" in selected else None
+    verdicts_path = None
+    if "jmq" in selected:
+        verdicts_path = (
+            str(Path(args.out).with_suffix(".verdicts.jsonl"))
+            if args.out
+            else "results/verdicts.jsonl"
+        )
+
+    default_report_id = f"{cand_set_id}-vs-{ref_set_id}"
+    try:
+        report = report_mod.score(
+            inputs,
+            report_id=Path(args.out).stem if args.out else default_report_id,
+            candidate_set=cand_set_id,
+            reference_set=ref_set_id,
+            embed_cache=embed_cache,
+            judge_client=judge_client,
+            verdicts_path=verdicts_path,
+            metrics=args.metrics,
+            seed=args.seed,
+            judge_model=args.judge,
+            embedder_id=args.embedder,
+        )
+    except InputSetValidationError as exc:
+        _progress(f"dehip score: input validation failed: {exc}")
+        return EXIT_VALIDATION
+
+    _emit_report(report, args.out, report_mod)
+    return EXIT_SUCCESS
+
+
+def _emit_report(report, out_path, report_mod) -> None:
+    """Write the report JSON (and a sibling .md) and echo the JSON to stdout."""
+    from dataclasses import asdict
+    from pathlib import Path
+
+    from dehip.schemas import write_json
+
+    if out_path:
+        write_json(report, out_path)
+        md_path = str(Path(out_path).with_suffix(".md"))
+        Path(md_path).write_text(
+            report_mod.render_markdown(report), encoding="utf-8"
+        )
+        _progress(f"dehip score: wrote {out_path} and {md_path}")
+    json.dump(asdict(report), sys.stdout)
+    sys.stdout.write("\n")
+
+
 def _add_score(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser(
         "score", help="The harness (FR-001..004, FR-008, FR-009)."
@@ -130,11 +243,15 @@ def _add_score(subparsers: argparse._SubParsersAction) -> None:
         help="Re-aggregate from a verdicts.jsonl without API calls (FR-008).",
     )
     parser.add_argument(
+        "--prompts",
+        help="Prompts JSONL ({pair_id, prompt}) for JMQ; required when jmq runs.",
+    )
+    parser.add_argument(
         "--yes",
         action="store_true",
         help="Confirm JMQ spend above the cost threshold (FR-009).",
     )
-    parser.set_defaults(func=lambda a: _run_stub("score", a))
+    parser.set_defaults(func=_run_score)
 
 
 def _add_self_check(subparsers: argparse._SubParsersAction) -> None:
