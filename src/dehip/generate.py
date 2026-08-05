@@ -16,22 +16,33 @@ review:
   transformers path (:class:`TransformersDraftModel`) is thin glue behind the
   seam and is constructed lazily, only when a real run is about to start.
 
-- **Resumability keys on ``pair_id`` and survives a truncated tail.** Bundles
-  are appended one JSON object per line to ``bundles.jsonl`` and flushed as each
-  completes, mirroring how ``jmq.py`` persists verdicts and ``corpus.py``
-  appends pairs. On resume, :func:`load_done_pair_ids` reads that file line by
-  line and **skips any unparseable line** (a partially-written final record left
-  by a crash mid-flush) rather than aborting, counting the skips so the caller
-  can report them. A pair whose bundle was truncated is simply regenerated -- no
-  duplicate, no corruption.
+- **Resumability keys on ``pair_id`` and survives a torn tail two ways.**
+  Bundles are appended one JSON object per line to ``bundles.jsonl``, each
+  fsync'd as it completes, mirroring how ``jmq.py`` persists verdicts and
+  ``corpus.py`` appends pairs. On resume, :func:`load_done_pair_ids` reads that
+  file line by line and **skips any unparseable line** (a partially-written
+  final record left by a crash mid-flush) rather than aborting, counting the
+  skips. It also terminates a *torn* tail -- a final record with no trailing
+  newline, left by a crash between the record and newline writes -- via
+  :func:`_repair_torn_tail` before the first resume append, so the regenerated
+  record lands on its own line instead of concatenating onto the fragment into
+  one unparseable line that would silently drop the pair. Either way a pair
+  whose bundle was torn is simply regenerated -- no duplicate, no corruption.
 
-Seeds (torch + python ``random`` + numpy) are recorded in every bundle's
-``draft.sampling.seed`` so a run is reproducible. The real model seeds all three
-RNGs before each generation call.
+Seeds are recorded in every bundle's ``draft.sampling.seed`` so a run is
+reproducible. The recorded seed is the *effective per-pair seed*, derived
+deterministically from ``(base_seed, pair_id)`` via :func:`_derive_pair_seed`,
+not the run-wide base seed: resetting the same base seed before every call makes
+every pair sample from an identical RNG state (correlated, low-diversity, even
+byte-identical drafts when prompts coincide), so drafts are decorrelated per
+pair while a single regenerated pair still reproduces its original draft. The
+real model seeds all three RNGs (torch + python ``random`` + numpy) with that
+effective seed before each generation call.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -50,6 +61,9 @@ __all__ = [
     "DEFAULT_TEMPERATURE",
     "DEFAULT_TOP_P",
     "ModelLoadError",
+    "GenerationError",
+    "EmptyDraftError",
+    "CorpusDriftError",
     "DraftModel",
     "TransformersDraftModel",
     "load_done_pair_ids",
@@ -78,6 +92,38 @@ class ModelLoadError(RuntimeError):
     exit-code discipline the ``score`` command uses, so a bad ``--model`` or a
     missing local checkout reports a clean exit-3 diagnostic rather than a bare
     transformers traceback.
+    """
+
+
+class GenerationError(RuntimeError):
+    """Raised when a mid-run generation fails against an external dependency.
+
+    Covers a degenerate/empty generation (:class:`EmptyDraftError`) and a
+    runtime failure inside ``model.generate`` that the seam did not normalize to
+    :class:`ModelLoadError` (torch OOM, a chat-template ``KeyError``, a
+    device-side ``RuntimeError``). The CLI maps this to exit 3 (external
+    dependency), so a mid-run model blowup reports a clean exit-3 diagnostic
+    rather than escaping as a bare exit-1 traceback.
+    """
+
+
+class EmptyDraftError(GenerationError):
+    """Raised when ``model.generate`` returns an empty / whitespace-only draft.
+
+    A blank draft must never be persisted as a finished bundle: it would be
+    counted, listed in the manifest, and read downstream by ``score`` as a real
+    (blank) draft -- silent corruption -- and on resume the pair would read as
+    done, so the blank would never be regenerated. Failing loudly instead means
+    the offending pair keeps NO bundle, so a later re-run regenerates it.
+    """
+
+
+class CorpusDriftError(ValueError):
+    """Raised when persisted bundles carry pair_ids absent from the input corpus.
+
+    Resuming a run dir built from a different (or larger) corpus would otherwise
+    silently merge stale bundles into the new manifest. Subclasses ``ValueError``
+    so the CLI's existing input-error handler maps it to exit 2.
     """
 
 
@@ -118,6 +164,16 @@ class TransformersDraftModel:
         self._model: Any = None
         self._tokenizer: Any = None
         self._device: str | None = None
+
+    @property
+    def device(self) -> str | None:
+        """The selected torch device (``mps``/``cuda``/``cpu``), or None if unloaded.
+
+        Surfaced so a silent MPS/CUDA->CPU fallback is visible: the generation
+        driver reads this after the first :meth:`generate` and records it in the
+        run summary (IMPORTANT 4).
+        """
+        return self._device
 
     @staticmethod
     def _autodetect_device() -> str:
@@ -177,29 +233,60 @@ class TransformersDraftModel:
         top_p: float,
         seed: int,
     ) -> str:
-        """Generate one draft for ``prompt`` with the recorded sampling settings."""
+        """Generate one draft for ``prompt`` with the recorded sampling settings.
+
+        A runtime failure inside the actual generation (torch OOM, a device-side
+        ``RuntimeError``, a missing-chat-template ``KeyError``) is normalized to
+        :class:`GenerationError` so the CLI maps it to exit 3 (external
+        dependency) rather than letting it escape as a bare exit-1 traceback.
+        Loading failures stay :class:`ModelLoadError` (also exit 3) via
+        :meth:`_ensure_loaded`.
+        """
         self._ensure_loaded()
         self._seed_everything(seed)
 
         import torch
 
-        # Use the chat template so the instruct model sees a proper user turn.
-        messages = [{"role": "user", "content": prompt}]
-        text = self._tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        inputs = self._tokenizer(text, return_tensors="pt").to(self._device)
-        with torch.no_grad():
-            output_ids = self._model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=True,
-                temperature=temperature,
-                top_p=top_p,
+        try:
+            # Use the chat template so the instruct model sees a proper user turn.
+            messages = [{"role": "user", "content": prompt}]
+            text = self._tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
             )
-        # Strip the prompt tokens; decode only the newly generated continuation.
-        generated = output_ids[0][inputs["input_ids"].shape[1] :]
-        return self._tokenizer.decode(generated, skip_special_tokens=True).strip()
+            inputs = self._tokenizer(text, return_tensors="pt").to(self._device)
+            with torch.no_grad():
+                output_ids = self._model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=True,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+            # Strip the prompt tokens; decode only the new generated continuation.
+            generated = output_ids[0][inputs["input_ids"].shape[1] :]
+            return self._tokenizer.decode(generated, skip_special_tokens=True).strip()
+        except Exception as exc:  # noqa: BLE001 - normalize mid-run generation failure
+            raise GenerationError(
+                f"instruct model {self.model_id!r} failed mid-generation: {exc}"
+            ) from exc
+
+
+# --- Seeds -------------------------------------------------------------------
+
+
+def _derive_pair_seed(base_seed: int, pair_id: str) -> int:
+    """Derive a deterministic per-pair seed from ``(base_seed, pair_id)``.
+
+    Distinct per pair (so drafts are decorrelated) yet stable (so re-generating
+    one pair reproduces its original draft). A blake2b digest over
+    ``{base_seed}:{pair_id}`` gives a well-distributed value; it is masked to 32
+    bits so the result is a valid seed for torch/numpy (both reject seeds outside
+    ``[0, 2**32)``), and ``random.seed`` accepts any int.
+    """
+    digest = hashlib.blake2b(
+        f"{base_seed}:{pair_id}".encode(), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big") & 0xFFFFFFFF
 
 
 # --- Resumability ------------------------------------------------------------
@@ -257,18 +344,60 @@ def _bundle_from_raw(raw: dict[str, Any]) -> RewriteBundle:
     return _from_dict(raw, RewriteBundle)
 
 
+def _repair_torn_tail(bundles_path: Path) -> bool:
+    """Terminate a torn last line before the first resume append; return if repaired.
+
+    A crash between an append's record write and its newline write (or before an
+    ``os.fsync`` completed the newline) leaves the final record with NO trailing
+    newline. The next append would then concatenate its JSON onto that fragment,
+    producing a single unparseable line that :func:`load_done_pair_ids` /
+    :func:`_read_all_bundles` skip -- silently dropping the freshly regenerated
+    pair from the bundles, manifest, and draft-texts while the run still exits 0.
+    Repair the boundary by appending a lone newline so the torn record stays on
+    its own (skippable) line and the regenerated record lands cleanly on the next.
+
+    Returns ``True`` if a newline was appended (the file existed, was non-empty,
+    and did not end in ``\\n``), ``False`` otherwise (missing/empty/already
+    newline-terminated).
+    """
+    import os
+
+    if not bundles_path.exists():
+        return False
+    with bundles_path.open("rb") as fh:
+        try:
+            fh.seek(-1, 2)  # last byte
+        except OSError:
+            return False  # empty file
+        last = fh.read(1)
+    if last in (b"", b"\n"):
+        return False
+    with bundles_path.open("ab") as fh:
+        fh.write(b"\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    return True
+
+
 def _append_bundle(bundle: RewriteBundle, bundles_path: Path) -> None:
-    """Append one RewriteBundle to bundles.jsonl, flushing so a crash keeps it.
+    """Append one RewriteBundle to bundles.jsonl, fsync'd so a crash keeps it.
 
     Mirrors ``corpus._append_pair`` / ``jmq``'s single-writer persistence: each
-    record is written and flushed to the OS as it completes, so an interrupt
-    keeps every finished draft on disk.
+    record is written, flushed, and ``os.fsync``'d as it completes, so even a
+    host crash (not just a process kill) keeps every finished draft durably on
+    disk. The record and its trailing newline are written before the fsync, so a
+    completed append is always a whole newline-terminated line; a crash *before*
+    the fsync can still leave a torn tail, which :func:`_repair_torn_tail`
+    terminates on the next resume.
     """
+    import os
+
     bundles_path.parent.mkdir(parents=True, exist_ok=True)
     with bundles_path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(_to_dict(bundle), ensure_ascii=False))
         fh.write("\n")
         fh.flush()
+        os.fsync(fh.fileno())
 
 
 # --- Draft-texts manifest ----------------------------------------------------
@@ -409,7 +538,9 @@ def generate_drafts(
 
     Returns:
         A summary dict: pair counts (total / already-done / generated), the
-        skipped-truncated-line count, and the written artifact paths.
+        skipped-truncated-line count, the selected model ``device`` (so a silent
+        MPS/CUDA->CPU fallback is visible; ``None`` for a seam without one), and
+        the written artifact paths.
     """
     run_dir = Path(run_dir)
     bundles_path = run_dir / BUNDLES_FILENAME
@@ -432,6 +563,16 @@ def generate_drafts(
             "from a prior interrupted run; those pairs will be regenerated"
         )
 
+    # Repair a torn tail (a crash between an append's record and its newline)
+    # BEFORE the first resume append, so the regenerated record lands on its own
+    # line instead of concatenating onto the fragment into one unparseable line
+    # that would silently drop the pair (CRITICAL 1).
+    if _repair_torn_tail(bundles_path):
+        printer(
+            "dehip generate: repaired a torn final bundle line (no trailing "
+            "newline) from a prior interrupted run before resuming"
+        )
+
     remaining = [pair for pair in pair_list if pair.pair_id not in done_ids]
     printer(
         f"dehip generate: {len(pair_list)} pairs, {len(done_ids)} already drafted, "
@@ -440,12 +581,23 @@ def generate_drafts(
 
     generated = 0
     for pair in remaining:
+        pair_seed = _derive_pair_seed(seed, pair.pair_id)
         draft_text = model.generate(
             pair.prompt,
             temperature=temperature,
             top_p=top_p,
-            seed=seed,
+            seed=pair_seed,
         )
+        # A blank draft must NOT be persisted as a finished bundle: it would be
+        # counted, manifested, and read downstream as a real (blank) draft, and
+        # on resume the pair would read as done. Fail loudly so the pair keeps no
+        # bundle and a later re-run regenerates it (CRITICAL 2).
+        if not draft_text or not draft_text.strip():
+            raise EmptyDraftError(
+                f"model produced an empty/whitespace-only draft for pair "
+                f"{pair.pair_id!r} (seed {pair_seed}); refusing to persist it as "
+                "a finished bundle. Re-run to regenerate this pair."
+            )
         bundle = _make_bundle(
             run_id=run_id,
             pair=pair,
@@ -453,7 +605,7 @@ def generate_drafts(
             model_id=model_id,
             temperature=temperature,
             top_p=top_p,
-            seed=seed,
+            seed=pair_seed,
         )
         _append_bundle(bundle, bundles_path)
         generated += 1
@@ -466,9 +618,26 @@ def generate_drafts(
     # defensively through load_done_pair_ids' tolerant path instead.
     bundles = _read_all_bundles(bundles_path)
 
+    # Guard against manifest/bundle drift: a run dir built from a different or
+    # larger corpus carries pair_ids the current corpus does not, which would
+    # otherwise be silently merged into this manifest. Fail loudly (exit 2),
+    # naming the stray ids (IMPORTANT 3).
+    input_ids = {pair.pair_id for pair in pair_list}
+    stray = sorted({b.pair_id for b in bundles} - input_ids)
+    if stray:
+        raise CorpusDriftError(
+            "persisted bundles carry pair_ids absent from the input corpus "
+            f"(stale run dir?): {stray}. Refusing to merge them into the "
+            "manifest."
+        )
+
     # Order the manifest by the input pair order for determinism.
     order = {pair.pair_id: index for index, pair in enumerate(pair_list)}
     bundles.sort(key=lambda b: order.get(b.pair_id, len(order)))
+
+    device = getattr(model, "device", None)
+    if device is not None:
+        printer(f"dehip generate: model device = {device}")
 
     set_id = f"{corpus}-{len(bundles)}-draft"
     manifest = _write_draft_texts_and_manifest(
@@ -487,6 +656,7 @@ def generate_drafts(
         "already_done": len(done_ids),
         "generated": generated,
         "skipped_truncated": skipped,
+        "device": device,
         "bundles": str(bundles_path),
         "draft_texts": str(_rewrite_texts_file(run_dir)),
         "manifest": str(run_dir / DRAFT_MANIFEST_FILENAME),

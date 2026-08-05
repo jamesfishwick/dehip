@@ -194,8 +194,12 @@ def _run_generate(args: argparse.Namespace) -> int:
     # bad input rather than exit 3.
     try:
         pairs = read_jsonl(args.corpus, Pair)
-    except FileNotFoundError as exc:
-        _progress(f"dehip generate: corpus not found: {exc}")
+    except OSError as exc:
+        # OSError covers FileNotFoundError plus IsADirectoryError / PermissionError
+        # (--corpus pointing at a directory or an unreadable file) -- all the
+        # user's input being wrong -> exit 2, mirroring the score command's OSError
+        # handling, rather than escaping as a bare exit-1 traceback.
+        _progress(f"dehip generate: corpus not readable: {exc}")
         return EXIT_VALIDATION
     except (json.JSONDecodeError, SchemaVersionError, SchemaValidationError) as exc:
         _progress(f"dehip generate: corrupt corpus file: {exc}")
@@ -229,8 +233,18 @@ def _run_generate(args: argparse.Namespace) -> int:
         # traceback.
         _progress(f"dehip generate: model load failed: {exc}")
         return EXIT_EXTERNAL_DEP
+    except generate_mod.GenerationError as exc:
+        # A mid-run generation failure that the seam normalized to GenerationError
+        # (torch OOM, a device-side RuntimeError, a missing-chat-template
+        # KeyError, or an empty/degenerate draft) is an external-dependency
+        # failure (exit 3), not a bare exit-1 traceback. Scoped to the seam's
+        # normalized type so a genuine logic bug in generate_drafts is NOT
+        # swallowed as exit 3.
+        _progress(f"dehip generate: generation failed: {exc}")
+        return EXIT_EXTERNAL_DEP
     except ValueError as exc:
-        # Zero-pairs / heterogeneous-corpus input errors -> exit 2.
+        # Zero-pairs / heterogeneous-corpus / corpus-drift input errors -> exit 2.
+        # (CorpusDriftError subclasses ValueError.)
         _progress(f"dehip generate: input error: {exc}")
         return EXIT_VALIDATION
 
