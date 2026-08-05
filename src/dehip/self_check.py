@@ -46,18 +46,37 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from dehip.metrics.bounds import StubInstrumentBounds
+from dehip.metrics.bounds import StubInstrumentBounds, jmq_scaled_window
 from dehip.report import MetricInputs, score
 from dehip.validate import DEFAULT_MIN_N, InputSetValidationError
+
+# The self-check requires at least this many valid JMQ comparisons for the
+# win-rate gate to mean anything. A non-skip run that produces fewer (a broken
+# judge emitting all-invalid verdicts collapses to n=0) FAILS LOUDLY (CRITICAL
+# 2) rather than skipping the window and reporting a spurious pass -- a broken
+# judge must be distinguishable from a deliberately-skipped one.
+JMQ_MIN_VALID_COMPARISONS = 1
 
 __all__ = [
     "SelfCheckResult",
     "SelfCheckOutOfBounds",
+    "SelfCheckIntegrityError",
     "StubInstrumentBounds",
     "split_pairs",
     "load_reference_set",
     "run_self_check",
 ]
+
+
+class SelfCheckIntegrityError(AssertionError):
+    """Raised when the self-check's own construction is broken (not a metric bound).
+
+    A structural invariant of the check itself failed -- e.g. the seeded split
+    leaked a pair_id into both halves, which would let a text be compared against
+    itself and fake a zero. This is a fail-loudly case distinct from a metric
+    being out of bounds; the CLI maps it to the self-check exit code (4), never a
+    bare ``AssertionError`` escaping as exit 1 (IMPORTANT 3).
+    """
 
 
 class SelfCheckOutOfBounds(AssertionError):
@@ -87,7 +106,15 @@ class SelfCheckResult:
             never allows -- MMD always runs).
         token_l2: The token-L2 distance scored.
         jmq_win_rate: The overall JMQ model win-rate, or None when JMQ was
-            skipped (``--skip-jmq``) or produced no valid verdicts.
+            skipped (``--skip-jmq``). On a non-skip run that produced no valid
+            verdicts this is None AND a violation is recorded (CRITICAL 2), so a
+            None here on a non-skip run is a loud failure, not a quiet pass.
+        jmq_n: The number of valid JMQ comparisons the win-rate was computed over,
+            or None when JMQ was skipped. Recorded so the scaled window is
+            auditable.
+        jmq_window: The effective ``(lo, hi)`` scaled win-rate window the run was
+            gated against (centered on 0.5, scaled to ``jmq_n``), or None when JMQ
+            was skipped or produced no valid comparisons. Auditable (CRITICAL 1).
         half_size: Number of pairs in each half (the two halves are equal-sized).
         dropped_pair_id: The single pair_id dropped for an odd-N set, or None
             when N was even. Recorded so the drop is auditable.
@@ -99,6 +126,8 @@ class SelfCheckResult:
     mmd: float
     token_l2: float
     jmq_win_rate: float | None
+    jmq_n: int | None
+    jmq_window: tuple[float, float] | None
     half_size: int
     dropped_pair_id: str | None
     violations: list[str]
@@ -153,7 +182,7 @@ def split_pairs(
     # it: a pair leaking into both halves would let a text be compared against
     # itself and fake a zero, defeating the whole check.
     if set(half_a) & set(half_b):
-        raise AssertionError(
+        raise SelfCheckIntegrityError(
             "self-check split produced overlapping halves; a pair_id leaked into "
             "both, which would let a text be compared against itself"
         )
@@ -252,21 +281,48 @@ def _check_bounds(
     mmd: float,
     token_l2: float,
     jmq_win_rate: float | None,
+    jmq_n: int | None,
     bounds: StubInstrumentBounds,
-) -> list[str]:
-    """Collect every bound violation, naming the bound and the overage.
+    *,
+    skip_jmq: bool,
+) -> tuple[list[str], tuple[float, float] | None]:
+    """Collect every bound violation and the effective JMQ window.
 
     Each metric is checked against its documented noise bound; a violation string
     names the bound, the observed value, the limit, and the overage so the failure
-    is diagnosable, not a bare boolean. All three are checked (no short-circuit)
+    is diagnosable, not a bare boolean. Everything is checked (no short-circuit)
     so one run reports every problem at once.
+
+    Returns ``(violations, jmq_window)`` where ``jmq_window`` is the effective
+    ``(lo, hi)`` scaled win-rate window this run was gated against (or None when
+    JMQ was skipped or produced no valid comparisons), recorded for audit.
+
+    MMD is checked against BOTH an upper and a lower bound. The upper check keeps
+    the ``not (x <= max)`` form so a NaN (never <= max) trips a violation. The
+    lower check traps a sign-flip/broken-kernel regression driving unbiased MMD^2
+    strongly negative (which the upper-only check would pass).
+
+    The JMQ win-rate is gated against a window SCALED to the valid comparison
+    count ``jmq_n`` (centered on 0.5), not the fixed [0.45,0.55] target, because
+    at the smoke tier that fixed window is statistically unsatisfiable for a fair
+    judge (CRITICAL 1). A non-skip run that produced no valid comparisons FAILS
+    LOUDLY (CRITICAL 2) rather than skipping the check.
     """
     violations: list[str] = []
+    jmq_window: tuple[float, float] | None = None
 
+    # MMD upper bound. `not (mmd <= max)` (not `mmd > max`) so NaN trips it too.
     if not (mmd <= bounds.mmd_max):
         violations.append(
             f"MMD^2 {mmd:.6g} exceeds the documented noise bound "
             f"{bounds.mmd_max:.6g} by {mmd - bounds.mmd_max:.6g}"
+        )
+    # MMD lower bound: unbiased MMD^2 straddles zero, so a strongly-negative value
+    # is a regression, not noise. `not (mmd >= min)` keeps a NaN tripping here too.
+    elif not (mmd >= bounds.mmd_min):
+        violations.append(
+            f"MMD^2 {mmd:.6g} is below the documented noise bound "
+            f"{bounds.mmd_min:.6g} by {bounds.mmd_min - mmd:.6g}"
         )
     # token-L2 is a distance (>= 0); the noise bound is an upper limit on it.
     if not (token_l2 <= bounds.token_l2_max):
@@ -275,21 +331,37 @@ def _check_bounds(
             f"{bounds.token_l2_max:.6g} by {token_l2 - bounds.token_l2_max:.6g}"
         )
 
-    if jmq_win_rate is not None:
-        if jmq_win_rate < bounds.jmq_win_rate_min:
-            violations.append(
-                f"JMQ win-rate {jmq_win_rate:.4f} is below the documented bound "
-                f"{bounds.jmq_win_rate_min:.4f} by "
-                f"{bounds.jmq_win_rate_min - jmq_win_rate:.4f}"
-            )
-        elif jmq_win_rate > bounds.jmq_win_rate_max:
-            violations.append(
-                f"JMQ win-rate {jmq_win_rate:.4f} is above the documented bound "
-                f"{bounds.jmq_win_rate_max:.4f} by "
-                f"{jmq_win_rate - bounds.jmq_win_rate_max:.4f}"
-            )
+    if skip_jmq:
+        return violations, jmq_window
 
-    return violations
+    # JMQ was REQUESTED. A run that produced no usable win-rate (broken judge:
+    # every verdict invalid -> jmq_n == 0 -> win_rate None) must fail loudly, not
+    # skip the window (CRITICAL 2). Distinguish this from --skip-jmq above.
+    if jmq_win_rate is None or jmq_n is None or jmq_n < JMQ_MIN_VALID_COMPARISONS:
+        violations.append(
+            "JMQ was requested but the judge produced no valid win-rate "
+            f"(valid comparisons n={jmq_n if jmq_n is not None else 0}, floor "
+            f"{JMQ_MIN_VALID_COMPARISONS}); a broken judge must not pass as a "
+            "skipped one"
+        )
+        return violations, jmq_window
+
+    lo, hi = jmq_scaled_window(jmq_n)
+    jmq_window = (lo, hi)
+    if jmq_win_rate < lo:
+        violations.append(
+            f"JMQ win-rate {jmq_win_rate:.4f} is below the scaled window "
+            f"[{lo:.4f}, {hi:.4f}] (n={jmq_n}, centered on 0.50) by "
+            f"{lo - jmq_win_rate:.4f}"
+        )
+    elif jmq_win_rate > hi:
+        violations.append(
+            f"JMQ win-rate {jmq_win_rate:.4f} is above the scaled window "
+            f"[{lo:.4f}, {hi:.4f}] (n={jmq_n}, centered on 0.50) by "
+            f"{jmq_win_rate - hi:.4f}"
+        )
+
+    return violations, jmq_window
 
 
 def run_self_check(
@@ -361,8 +433,14 @@ def run_self_check(
         "metrics": metrics,
         "seed": seed,
     }
-    if embedder_id is not None:
-        score_kwargs["embedder_id"] = embedder_id
+    # Record the embedder that actually ran, not a config default (NIT). Prefer an
+    # explicit embedder_id, else read it off the injected cache/embedder, so the
+    # report's embedder_id can never silently disagree with the instrument used.
+    effective_embedder_id = embedder_id
+    if effective_embedder_id is None and embed_cache is not None:
+        effective_embedder_id = getattr(embed_cache, "embedder_id", None)
+    if effective_embedder_id is not None:
+        score_kwargs["embedder_id"] = effective_embedder_id
     if judge_model is not None:
         score_kwargs["judge_model"] = judge_model
     if not skip_jmq:
@@ -377,18 +455,28 @@ def run_self_check(
     mmd = float(report.mmd)
     token_l2 = float(report.token_l2)
     jmq_win_rate: float | None = None
+    jmq_n: int | None = None
     if not skip_jmq:
         overall = report.jmq.get("overall") if report.jmq else None
         if isinstance(overall, dict):
             jmq_win_rate = overall.get("win_rate")
+            # The count of VALID comparisons the win-rate was computed over.
+            # jmq.py sets win_rate=None and n=0 when every verdict is invalid;
+            # both surface here so CRITICAL 2 can fail an all-invalid run loudly.
+            raw_n = overall.get("n")
+            jmq_n = int(raw_n) if isinstance(raw_n, (int, float)) else 0
 
-    violations = _check_bounds(mmd, token_l2, jmq_win_rate, bounds)
+    violations, jmq_window = _check_bounds(
+        mmd, token_l2, jmq_win_rate, jmq_n, bounds, skip_jmq=skip_jmq
+    )
 
     result = SelfCheckResult(
         report=report,
         mmd=mmd,
         token_l2=token_l2,
         jmq_win_rate=jmq_win_rate,
+        jmq_n=None if skip_jmq else jmq_n,
+        jmq_window=jmq_window,
         half_size=len(half_a),
         dropped_pair_id=dropped,
         violations=violations,

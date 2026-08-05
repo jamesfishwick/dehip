@@ -23,16 +23,22 @@ The suite locks the invariants the adversarial review probes:
 from __future__ import annotations
 
 import json
+import random
 import re
 
 import numpy as np
 import pytest
 
 from dehip import cli
-from dehip.metrics.bounds import STUB_INSTRUMENT_BOUNDS, StubInstrumentBounds
+from dehip.metrics.bounds import (
+    STUB_INSTRUMENT_BOUNDS,
+    StubInstrumentBounds,
+    jmq_scaled_window,
+)
 from dehip.metrics.embeddings import EmbeddingCache
 from dehip.schemas import TextSet, write_json
 from dehip.self_check import (
+    SelfCheckIntegrityError,
     SelfCheckOutOfBounds,
     load_reference_set,
     run_self_check,
@@ -107,6 +113,73 @@ class ExplodingJudge:
         raise AssertionError(
             "judge was called on a --skip-jmq run; no judge spend is allowed"
         )
+
+
+class RandomFairJudge:
+    """A genuinely random p=0.5 judge (indifferent between the two candidates).
+
+    Unlike TargetedJudge, this does NOT rig the outcome: it flips a seeded coin
+    per (pair, dimension) with no reference to the model/human slot, so the model
+    win-rate is a real Binomial(n, 0.5) sample. It proves the SCALED window is
+    reachable by an honest fair judge (not just a rigged 0.52), across several
+    seeds, at n=25 -- the reachability CRITICAL 1 requires.
+    """
+
+    def __init__(self, seed: int) -> None:
+        self._rng = random.Random(seed)
+
+    def judge(self, rendered_prompt: str, *, model: str) -> str:
+        return "A" if self._rng.random() < 0.5 else "B"
+
+
+class AlwaysModelJudge:
+    """A broken judge that ALWAYS makes the model win (win-rate 1.0).
+
+    Reconstructs the model's slot from the seeded A/B order and always picks it,
+    so every valid comparison is a model win. Trips the scaled window from above.
+    """
+
+    def __init__(self, seed: int) -> None:
+        self.seed = seed
+
+    def judge(self, rendered_prompt: str, *, model: str) -> str:
+        from dehip.metrics.jmq import assign_order
+
+        index = int(re.search(r"sc-(\d+)", rendered_prompt).group(1))
+        order = assign_order(f"sc-{index}", self.seed)
+        return "A" if order == "model_first" else "B"
+
+
+class AlwaysHumanJudge:
+    """A broken judge that ALWAYS makes the human win (model win-rate 0.0).
+
+    The inverse of AlwaysModelJudge: always picks the human's slot, so the model
+    never wins. Trips the scaled window from below.
+    """
+
+    def __init__(self, seed: int) -> None:
+        self.seed = seed
+
+    def judge(self, rendered_prompt: str, *, model: str) -> str:
+        from dehip.metrics.jmq import assign_order
+
+        index = int(re.search(r"sc-(\d+)", rendered_prompt).group(1))
+        order = assign_order(f"sc-{index}", self.seed)
+        # The human is the OTHER slot from the model.
+        return "B" if order == "model_first" else "A"
+
+
+class AllInvalidJudge:
+    """A broken judge whose every reply fails to parse (choice='invalid').
+
+    Every verdict is excluded-and-counted, so the valid-comparison count collapses
+    to n=0 and the win-rate is None. A non-skip run over this judge must FAIL
+    LOUDLY (CRITICAL 2): a broken judge that produced zero usable verdicts must
+    not be indistinguishable from a --skip-jmq run.
+    """
+
+    def judge(self, rendered_prompt: str, *, model: str) -> str:
+        return "the model is clearly better in every dimension"
 
 
 # --- Fixtures ----------------------------------------------------------------
@@ -479,3 +552,338 @@ def _patch_stub_instruments(monkeypatch):
     monkeypatch.setattr(
         "dehip.metrics.token_l2.Qwen3Tokenizer", lambda *a, **k: StubTokenizer()
     )
+
+
+# --- CRITICAL 1: JMQ window scaled to n, reachable by an honest fair judge ----
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3, 4, 5, 6, 7])
+def test_random_fair_judge_passes_scaled_window(tmp_path, seed):
+    """A genuinely random p=0.5 judge lands inside the scaled window at n=25.
+
+    CRITICAL 1: the fixed [0.45, 0.55] window is unsatisfiable at the smoke tier
+    (~0.31 pass under Binomial(25, 0.5)). The scaled window 0.5 +/- Z_JMQ *
+    sqrt(0.25/n) must PASS an honest fair judge -- not just the rigged 0.52 of
+    TargetedJudge -- across several seeds. This proves reachability, not rigging.
+    """
+    manifest = _write_reference(tmp_path, 50)  # 25 vs 25 -> n=25 comparisons
+    judge = RandomFairJudge(seed=seed)
+    result = run_self_check(
+        manifest,
+        seed=seed,
+        embed_cache=_cache(tmp_path),
+        tokenizer=StubTokenizer(),
+        judge_client=judge,
+        verdicts_path=str(tmp_path / f"verdicts-{seed}.jsonl"),
+    )
+    assert result.passed, result.violations
+    # The window was scaled to the actual valid-comparison count and recorded.
+    assert result.jmq_n == 25
+    lo, hi = jmq_scaled_window(25)
+    assert result.jmq_window == (lo, hi)
+    assert lo <= result.jmq_win_rate <= hi
+
+
+def test_scaled_window_widens_at_small_n_and_narrows_at_large_n():
+    """The window is centered on 0.5, wide at n=25, narrowing toward 45-55%."""
+    lo25, hi25 = jmq_scaled_window(25)
+    # At n=25 the window is [0.20, 0.80] -- far wider than [0.45, 0.55].
+    assert lo25 == pytest.approx(0.20, abs=1e-9)
+    assert hi25 == pytest.approx(0.80, abs=1e-9)
+    # As n grows the window narrows toward the documented [0.45, 0.55] target.
+    lo200, hi200 = jmq_scaled_window(200)
+    assert 0.45 > lo200 > lo25  # tighter than n=25, still looser than 0.45
+    assert 0.55 < hi200 < hi25
+    # Centered on 0.5 for any n.
+    assert (lo200 + hi200) / 2 == pytest.approx(0.5, abs=1e-9)
+    # An empty n has no defined window -> loud error, never a silent pass.
+    with pytest.raises(ValueError):
+        jmq_scaled_window(0)
+
+
+def test_always_model_judge_trips_window_high(tmp_path):
+    """A judge with win-rate 1.0 trips exit 4 with a win-rate violation."""
+    manifest = _write_reference(tmp_path, 50)
+    with pytest.raises(SelfCheckOutOfBounds) as excinfo:
+        run_self_check(
+            manifest,
+            seed=0,
+            embed_cache=_cache(tmp_path),
+            tokenizer=StubTokenizer(),
+            judge_client=AlwaysModelJudge(seed=0),
+            verdicts_path=str(tmp_path / "verdicts.jsonl"),
+        )
+    # The violation names the JMQ win-rate window (loud on real breakage).
+    assert any(
+        "win-rate" in v and "above" in v for v in excinfo.value.violations
+    ), excinfo.value.violations
+
+
+def test_always_human_judge_trips_window_low(tmp_path):
+    """A judge with model win-rate 0.0 trips exit 4 with a win-rate violation."""
+    manifest = _write_reference(tmp_path, 50)
+    with pytest.raises(SelfCheckOutOfBounds) as excinfo:
+        run_self_check(
+            manifest,
+            seed=0,
+            embed_cache=_cache(tmp_path),
+            tokenizer=StubTokenizer(),
+            judge_client=AlwaysHumanJudge(seed=0),
+            verdicts_path=str(tmp_path / "verdicts.jsonl"),
+        )
+    assert any(
+        "win-rate" in v and "below" in v for v in excinfo.value.violations
+    ), excinfo.value.violations
+
+
+# --- CRITICAL 2: all-invalid verdicts on a non-skip run fail loudly -----------
+
+
+def test_all_invalid_verdicts_fail_loudly(tmp_path):
+    """A judge producing ZERO valid verdicts on a non-skip run must NOT pass.
+
+    CRITICAL 2: jmq.py returns win_rate None when every verdict is invalid. That
+    must be a loud non-zero failure naming the reason, never a silent exit-0 pass
+    indistinguishable from --skip-jmq.
+    """
+    manifest = _write_reference(tmp_path, 50)
+    with pytest.raises(SelfCheckOutOfBounds) as excinfo:
+        run_self_check(
+            manifest,
+            seed=0,
+            embed_cache=_cache(tmp_path),
+            tokenizer=StubTokenizer(),
+            judge_client=AllInvalidJudge(),
+            verdicts_path=str(tmp_path / "verdicts.jsonl"),
+        )
+    assert any(
+        "no valid win-rate" in v for v in excinfo.value.violations
+    ), excinfo.value.violations
+
+
+def test_cli_all_invalid_verdicts_exits_nonzero(tmp_path, monkeypatch):
+    """Through the CLI, an all-invalid non-skip run exits 4 (not 0)."""
+    manifest = _write_reference(tmp_path, 50)
+    _patch_stub_instruments(monkeypatch)
+    # A non-skip run whose judge always returns an unparseable reply.
+    monkeypatch.setattr(
+        "dehip.metrics.jmq.OpenAIJudgeClient", lambda *a, **k: AllInvalidJudge()
+    )
+
+    rc = cli.main(["self-check", "--reference", manifest])
+    assert rc == cli.EXIT_SELF_CHECK == 4
+
+
+def test_skip_jmq_is_not_flagged_as_all_invalid(tmp_path):
+    """--skip-jmq (jmq_win_rate None by design) is a pass, NOT an all-invalid fail.
+
+    Distinguishes skip-requested from ran-but-all-invalid: a skipped run has
+    jmq_win_rate None and MUST pass; only a REQUESTED-but-empty run fails.
+    """
+    manifest = _write_reference(tmp_path, 50)
+    result = run_self_check(
+        manifest,
+        seed=0,
+        skip_jmq=True,
+        embed_cache=_cache(tmp_path),
+        tokenizer=StubTokenizer(),
+    )
+    assert result.passed
+    assert result.jmq_win_rate is None
+    assert result.jmq_n is None  # skipped, not zero-valid
+
+
+# --- IMPORTANT 1: MMD lower bound traps a negative-driving regression ---------
+
+
+def test_negative_mmd_regression_trips_lower_bound(tmp_path, monkeypatch):
+    """A strongly-negative MMD (sign flip / broken kernel) trips a violation.
+
+    IMPORTANT 1: unbiased MMD^2 straddles zero. Without a lower bound, a
+    regression driving MMD to -5.0 passes (`-5.0 <= 0.10`). The lower bound traps
+    it.
+    """
+    from dehip.metrics import mmd as mmd_mod
+
+    manifest = _write_reference(tmp_path, 30)
+
+    def _negative_mmd(x, y, bandwidth=None):
+        return mmd_mod.MMDResult(mmd2=-5.0, bandwidth=1.0)  # far below mmd_min
+
+    monkeypatch.setattr("dehip.report.mmd_mod.mmd2_unbiased", _negative_mmd)
+
+    with pytest.raises(SelfCheckOutOfBounds) as excinfo:
+        run_self_check(
+            manifest,
+            seed=0,
+            skip_jmq=True,
+            embed_cache=_cache(tmp_path),
+            tokenizer=StubTokenizer(),
+        )
+    assert any(
+        "MMD" in v and "below" in v for v in excinfo.value.violations
+    ), excinfo.value.violations
+
+
+def test_nan_mmd_trips_upper_bound(tmp_path, monkeypatch):
+    """A NaN MMD trips a violation, locking the `not (x <= max)` form.
+
+    IMPORTANT 1: `not (nan <= max)` is True (NaN comparisons are False), so NaN
+    trips the upper check. A refactor to `mmd > max` would let NaN pass; this
+    test forbids that.
+    """
+    from dehip.metrics import mmd as mmd_mod
+
+    manifest = _write_reference(tmp_path, 30)
+
+    def _nan_mmd(x, y, bandwidth=None):
+        return mmd_mod.MMDResult(mmd2=float("nan"), bandwidth=1.0)
+
+    monkeypatch.setattr("dehip.report.mmd_mod.mmd2_unbiased", _nan_mmd)
+
+    with pytest.raises(SelfCheckOutOfBounds) as excinfo:
+        run_self_check(
+            manifest,
+            seed=0,
+            skip_jmq=True,
+            embed_cache=_cache(tmp_path),
+            tokenizer=StubTokenizer(),
+        )
+    assert any("MMD" in v for v in excinfo.value.violations), excinfo.value.violations
+
+
+# --- IMPORTANT 2: bounds provenance is internally consistent ------------------
+
+
+def test_derivation_seeds_match_script_range():
+    """DERIVATION_SEEDS is 0..23, matching scripts/derive_bounds.py's range(24)."""
+    from dehip.metrics.bounds import DERIVATION_SEEDS
+
+    assert DERIVATION_SEEDS == tuple(range(24))
+
+
+def test_documented_bounds_clear_observed_max_over_derivation_seeds(tmp_path):
+    """Re-derive over 0..23 and confirm the 0.10 bounds clear the true max.
+
+    IMPORTANT 2: the documented ranges (MMD abs-max 0.02948646, token-L2 max
+    0.04379749) were derived over seeds 0..23. This re-runs the real self-check
+    path over those seeds with the stub instruments and asserts the chosen 0.10
+    bounds still bracket the observed noise with margin -- so the constant, the
+    docstring, and the script agree on the seed set actually used.
+    """
+    from dehip.metrics.bounds import DERIVATION_SEEDS
+
+    manifest = _write_reference(tmp_path, 50, set_id="stub-smoke-50")
+    open_bounds = StubInstrumentBounds(
+        mmd_max=float("inf"), mmd_min=float("-inf"), token_l2_max=float("inf")
+    )
+    mmds = []
+    token_l2s = []
+    for seed in DERIVATION_SEEDS:
+        result = run_self_check(
+            manifest,
+            seed=seed,
+            skip_jmq=True,
+            embed_cache=EmbeddingCache(StubEmbedder(), cache_dir=tmp_path / f"e{seed}"),
+            tokenizer=StubTokenizer(),
+            bounds=open_bounds,
+        )
+        mmds.append(result.mmd)
+        token_l2s.append(result.token_l2)
+
+    # The observed ranges reproduce the documented provenance numbers.
+    assert max(abs(m) for m in mmds) == pytest.approx(0.02948646, abs=1e-6)
+    assert max(token_l2s) == pytest.approx(0.04379749, abs=1e-6)
+    # The documented 0.10 bounds clear the true observed noise (both directions).
+    assert max(mmds) < STUB_INSTRUMENT_BOUNDS.mmd_max
+    assert min(mmds) > STUB_INSTRUMENT_BOUNDS.mmd_min
+    assert max(token_l2s) < STUB_INSTRUMENT_BOUNDS.token_l2_max
+
+
+# --- IMPORTANT 3: self-check integrity failure maps to a defined exit code ----
+
+
+def test_integrity_error_is_typed_not_bare_assertion():
+    """A leaked-pair split raises the typed SelfCheckIntegrityError (exit-mappable).
+
+    IMPORTANT 3: the disjointness guard must raise a typed error the CLI maps to a
+    defined exit code, not a bare AssertionError that surfaces as exit 1 (which
+    the exit-code contract has no case for).
+    """
+    import dehip.self_check as sc
+
+    # Force split_pairs past its shuffle with a stub that returns overlapping
+    # halves, so the disjointness guard fires and must raise the typed error.
+    ids = [f"p{i}" for i in range(10)]
+
+    class _OverlapShuffle:
+        def __init__(self, *a, **k):
+            pass
+
+        def shuffle(self, seq):
+            # Leave duplicated ids so the two halves overlap.
+            seq[:] = ids[:5] + ids[:5]
+
+    original = sc.random.Random
+    sc.random.Random = _OverlapShuffle
+    try:
+        with pytest.raises(SelfCheckIntegrityError):
+            split_pairs(ids, seed=0)
+    finally:
+        sc.random.Random = original
+
+
+def test_cli_maps_integrity_failure_to_self_check_exit(tmp_path, monkeypatch):
+    """The CLI maps a self-check integrity failure to exit 4, never exit 1.
+
+    IMPORTANT 3: even though the disjointness branch is hard to reach in normal
+    operation, the CLI must map the integrity failure to the defined self-check
+    exit code rather than letting a bare AssertionError escape as exit 1.
+    """
+    manifest = _write_reference(tmp_path, 40)
+    _patch_stub_instruments(monkeypatch)
+
+    def _raise_integrity(*a, **k):
+        raise SelfCheckIntegrityError("split leaked a pair into both halves")
+
+    monkeypatch.setattr("dehip.self_check.run_self_check", _raise_integrity)
+
+    rc = cli.main(["self-check", "--reference", manifest, "--skip-jmq"])
+    assert rc == cli.EXIT_SELF_CHECK == 4
+    assert rc != 1
+
+
+# --- NIT: embedder_id recorded from the injected instrument -------------------
+
+
+def test_embedder_id_recorded_from_injected_cache(tmp_path):
+    """The report's embedder_id comes from the instrument that ran, not a default.
+
+    NIT: the CLI does not pass embedder_id, so without this the report would
+    record the default nvidia/llama-embed-nemotron-8b regardless of what ran. The
+    injected stub cache carries embedder_id='stub-embedder'; the report must show
+    it.
+    """
+    manifest = _write_reference(tmp_path, 20)
+    result = run_self_check(
+        manifest,
+        seed=0,
+        skip_jmq=True,
+        embed_cache=_cache(tmp_path),  # StubEmbedder -> embedder_id 'stub-embedder'
+        tokenizer=StubTokenizer(),
+    )
+    assert result.report.config["embedder_id"] == "stub-embedder"
+
+
+def test_explicit_embedder_id_overrides_injected(tmp_path):
+    """An explicit embedder_id wins over the injected cache's id."""
+    manifest = _write_reference(tmp_path, 20)
+    result = run_self_check(
+        manifest,
+        seed=0,
+        skip_jmq=True,
+        embed_cache=_cache(tmp_path),
+        tokenizer=StubTokenizer(),
+        embedder_id="explicit-embedder",
+    )
+    assert result.report.config["embedder_id"] == "explicit-embedder"

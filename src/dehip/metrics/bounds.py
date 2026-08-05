@@ -20,8 +20,9 @@ Two bound sets live here:
 - :data:`REAL_INSTRUMENT_BOUNDS` -- the clearly-marked slot for issue #16. It is
   ``None`` today; #16's real smoke run over the FineWeb smoke corpus (50 pairs)
   with the production embedder and tokenizer will re-derive the bounds and fill
-  it in. Until then the CLI uses the stub bounds and the JMQ win-rate window
-  (45-55%, SC-001), which is instrument-independent.
+  it in. Until then the CLI uses the stub bounds and the scaled JMQ win-rate
+  window (:func:`jmq_scaled_window`, centered on 0.5, approaching SC-001's 45-55%
+  as n grows), which is instrument-independent.
 
 Derivation provenance for :data:`STUB_INSTRUMENT_BOUNDS`
 -------------------------------------------------------
@@ -42,7 +43,7 @@ Derivation provenance for :data:`STUB_INSTRUMENT_BOUNDS`
 - **Observed (24 seeds 0..23):**
     - MMD^2 ranged ``-0.02331335 .. +0.02948646`` (abs-max ``0.02948646``); the
       unbiased estimator is not constrained non-negative for same-distribution
-      samples, so it straddles zero.
+      samples, so it straddles zero (the negative floor is real, not a bug).
     - token-L2 ranged ``0.02505222 .. 0.04379749``.
 - **Contrast (justifies the margin):** the same instruments on a genuine
   distribution shift (a mean-shifted embedding set / a disjoint-vocabulary text
@@ -54,33 +55,97 @@ Derivation provenance for :data:`STUB_INSTRUMENT_BOUNDS`
       (0.0295) with ~3.4x headroom, far below the ~0.40 regression signal. MMD is
       checked as an upper bound: a same-distribution split sits at/below ~0 and
       passes; a regression pushes MMD up and trips it.
+    - ``mmd_min = -0.10`` -- a SYMMETRIC lower bound, below the observed negative
+      floor (-0.0233) with ~4.3x headroom. Unbiased MMD^2 straddles zero, so
+      without a lower bound a sign-flip or broken-kernel regression that drives
+      MMD strongly negative (``-5.0 <= 0.10`` is True) would pass silently. The
+      lower bound traps that: a regression pushing MMD far below zero trips it.
     - ``token_l2_max = 0.10`` -- ~2.3x the observed max (0.0438), far below the
-      ~0.57 regression signal.
+      ~0.57 regression signal. token-L2 is a distance (>= 0), so it needs no
+      lower bound.
 
 Re-derive with: ``uv run python scripts/derive_bounds.py``.
 
-JMQ win-rate bounds are NOT instrument-derived: SC-001 fixes them at 45-55%
-(a fair judge on two same-distribution halves wins ~half the comparisons). They
-apply to both stub and real instruments unchanged.
+JMQ win-rate bounds (:data:`STUB_INSTRUMENT_BOUNDS` fields
+``jmq_win_rate_min``/``jmq_win_rate_max``) are the documented ASYMPTOTIC target
+(45-55%, SC-001) -- the window a fair judge's win-rate approaches at large n.
+They are NOT applied as a fixed hard gate, because at the smoke tier they are
+statistically unsatisfiable: a 50-pair reference splits to n=25 comparisons, and
+for an indifferent judge (p=0.5) the probability of a win-rate landing in
+[0.45,0.55] (wins in {12,13}) is only ~0.31 under Binomial(25,0.5). A +/-0.05
+window is under one binomial standard deviation at n=25 (sqrt(0.25/25)=0.10), so
+the literal SC-001 spec would spuriously trip a real fair judge ~69% of runs.
+
+Instead the self-check gate is SCALED to the actual number of valid comparisons
+n, centered on 0.5: ``0.5 +/- Z_JMQ * sqrt(0.25 / n)`` (a normal-approximation
+interval on a p=0.5 Binomial's win-rate; see :data:`Z_JMQ` and
+:func:`jmq_scaled_window`). At :data:`Z_JMQ` = 3 the fair-judge pass rate is
+~99.7% (false-trip ~0.3%; exactly ~0.0009 at n=25), so the gate is loud on a
+broken judge (win-rate 1.0 or 0.0 trips it hard) without being flaky on honest
+noise. The window narrows as n grows -- [0.20,0.80] at n=25, [0.394,0.606] at
+n=200 (the judged tier's half~200), approaching the documented [0.45,0.55]
+target -- and the effective window and n are recorded in the self-check output so
+the gate is auditable. This applies to both stub and real instruments unchanged
+(it is instrument-independent).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import sqrt
 
 __all__ = [
     "StubInstrumentBounds",
     "DERIVATION_SEEDS",
     "DERIVATION_CORPUS_ID",
+    "Z_JMQ",
+    "jmq_scaled_window",
     "STUB_INSTRUMENT_BOUNDS",
     "REAL_INSTRUMENT_BOUNDS",
 ]
 
-# The seeds the stub-instrument bounds were derived over (scripts/derive_bounds).
-DERIVATION_SEEDS: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7)
+# The seeds the stub-instrument bounds were derived over (scripts/derive_bounds
+# uses tuple(range(24)); this must equal that set so the constant, the comment,
+# the module docstring, and the script all agree on the seeds actually used).
+DERIVATION_SEEDS: tuple[int, ...] = tuple(range(24))
 
 # The fixed stub smoke corpus id the derivation ran against (50 pairs).
 DERIVATION_CORPUS_ID = "stub-smoke-50"
+
+# Number of standard errors for the SCALED JMQ win-rate window (CRITICAL 1). The
+# fair-judge win-rate is a p=0.5 Binomial proportion with standard error
+# sqrt(0.25 / n); the acceptance window is 0.5 +/- Z_JMQ * that SE. At Z_JMQ = 3
+# a fair judge passes ~99.7% of runs (false-trip ~0.3%; ~0.0009 at n=25) while a
+# broken judge (win-rate 1.0 or 0.0) trips it hard. A wider z would let a
+# genuinely biased judge slip through; a narrower one reintroduces the flakiness
+# the fixed [0.45,0.55] window suffered at the smoke tier.
+Z_JMQ = 3.0
+
+
+def jmq_scaled_window(n: int, *, z: float = Z_JMQ) -> tuple[float, float]:
+    """Return the ``(lo, hi)`` JMQ win-rate acceptance window for ``n`` comparisons.
+
+    The window is ``0.5 +/- z * sqrt(0.25 / n)`` -- a normal-approximation
+    interval on a p=0.5 Binomial's win-rate, centered on the indifferent-judge
+    expectation. It is clamped to ``[0.0, 1.0]`` (a valid win-rate range) and
+    widens as ``n`` shrinks, so the gate stays loud on a broken judge without
+    tripping on the binomial noise a small ``n`` carries.
+
+    At ``n=25`` (the 50-pair smoke tier) the window is ``[0.20, 0.80]``; at
+    ``n=200`` (the judged tier's half~200) it narrows to ``[0.394, 0.606]``,
+    approaching the documented asymptotic ``[0.45, 0.55]`` target. Recording the
+    window and ``n`` in the self-check output makes the gate auditable.
+
+    Raises:
+        ValueError: if ``n <= 0`` (no comparisons -> no defined window; the
+            caller must treat an all-invalid run as a loud failure, not a pass).
+    """
+    if n <= 0:
+        raise ValueError(f"jmq_scaled_window needs n > 0 comparisons, got {n}")
+    half = z * sqrt(0.25 / n)
+    lo = max(0.0, 0.5 - half)
+    hi = min(1.0, 0.5 + half)
+    return lo, hi
 
 
 @dataclass(frozen=True)
@@ -88,9 +153,19 @@ class StubInstrumentBounds:
     """Noise bounds the self-check asserts against.
 
     ``mmd_max`` and ``token_l2_max`` are upper limits: a same-distribution split
-    scores at or below them, a metric regression exceeds them. ``jmq_win_rate_min``
-    and ``jmq_win_rate_max`` bracket the JMQ model win-rate window (SC-001's
-    45-55%). All four are inclusive limits.
+    scores at or below them, a metric regression exceeds them. ``mmd_min`` is a
+    lower limit: unbiased MMD^2 straddles zero, so a sign-flip/broken-kernel
+    regression that drives MMD strongly negative is trapped here (without it,
+    ``-5.0 <= mmd_max`` would pass). token-L2 is a distance (>= 0) and needs no
+    lower bound.
+
+    ``jmq_win_rate_min`` and ``jmq_win_rate_max`` are the documented ASYMPTOTIC
+    win-rate target (SC-001's 45-55%), NOT a fixed hard gate: at the smoke tier
+    (n=25) a +/-0.05 window is under one binomial SD and a fair judge would trip
+    it ~69% of runs. The self-check instead applies a window SCALED to the actual
+    comparison count n (:func:`jmq_scaled_window`, :data:`Z_JMQ`) which approaches
+    this target as n grows. See the module docstring for the statistical
+    justification of the deviation from SC-001's literal "45-55% on every run".
 
     The name says "stub" because the in-force values were derived with the stub
     instruments (see the module docstring); the class is reused for the real
@@ -100,6 +175,7 @@ class StubInstrumentBounds:
 
     mmd_max: float
     token_l2_max: float
+    mmd_min: float = -0.10
     jmq_win_rate_min: float = 0.45
     jmq_win_rate_max: float = 0.55
 
@@ -115,9 +191,10 @@ class StubInstrumentBounds:
 
 
 # In force today. Derived per the module docstring (2026-08-05, stub instruments,
-# stub-smoke-50 corpus, seeds 0..7). See scripts/derive_bounds.py to re-derive.
+# stub-smoke-50 corpus, seeds 0..23). See scripts/derive_bounds.py to re-derive.
 STUB_INSTRUMENT_BOUNDS = StubInstrumentBounds(
     mmd_max=0.10,
+    mmd_min=-0.10,
     token_l2_max=0.10,
     jmq_win_rate_min=0.45,
     jmq_win_rate_max=0.55,

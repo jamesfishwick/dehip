@@ -226,6 +226,15 @@ class EmbeddingCache:
         self._live_dim_verified = False
         self._load()
 
+    @property
+    def embedder_id(self) -> str:
+        """The wrapped embedder's id (its cache-key namespace).
+
+        Exposed so a caller (e.g. the self-check) can record the embedder that
+        actually ran instead of a config default, keeping provenance honest.
+        """
+        return self._embedder_id
+
     def _integrity_error(self, detail: str) -> CacheIntegrityError:
         return CacheIntegrityError(
             f"{detail} (cache_dir={self._cache_dir}). Recovery: clear this "

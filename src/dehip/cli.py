@@ -533,13 +533,19 @@ def _run_self_check(args: argparse.Namespace) -> int:
     Exit-code contract (cli.md): a bad reference set (too few pairs, a
     manifest/texts id mismatch, a missing/corrupt manifest) is input/data failure
     -> exit 2; an embedder model-load / cache-corruption / (JMQ) missing key or
-    judge-prompts is an external dependency -> exit 3; a metric out of bounds is
-    the self-check's own failure -> exit 4, naming which bound and by how much,
-    never a silent pass. ``--skip-jmq`` constructs NO judge (zero judge spend).
+    judge-prompts is an external dependency -> exit 3; a metric out of bounds OR a
+    self-check integrity failure (a split that leaked a pair into both halves) is
+    the self-check's own failure -> exit 4, naming the reason, never a silent pass
+    and never a bare exit-1 traceback. ``--skip-jmq`` constructs NO judge (zero
+    judge spend).
     """
     from dehip.metrics.embeddings import EmbeddingCache, TransformersEmbedder
     from dehip.schemas import SchemaValidationError, SchemaVersionError
-    from dehip.self_check import SelfCheckOutOfBounds, run_self_check
+    from dehip.self_check import (
+        SelfCheckIntegrityError,
+        SelfCheckOutOfBounds,
+        run_self_check,
+    )
     from dehip.validate import InputSetValidationError
 
     external_dep = _external_dep_exc_types()
@@ -577,6 +583,12 @@ def _run_self_check(args: argparse.Namespace) -> int:
         for violation in exc.violations:
             _progress(f"  - {violation}")
         return EXIT_SELF_CHECK
+    except SelfCheckIntegrityError as exc:
+        # The check's own construction is broken (e.g. a split leaked a pair into
+        # both halves). This is a fail-loudly integrity failure mapped to the
+        # self-check exit code, never a bare AssertionError escaping as exit 1.
+        _progress(f"dehip self-check: FAILED -- self-check integrity broken: {exc}")
+        return EXIT_SELF_CHECK
     except (
         InputSetValidationError,
         SchemaValidationError,
@@ -596,7 +608,8 @@ def _run_self_check(args: argparse.Namespace) -> int:
     _progress(
         f"dehip self-check: PASSED -- MMD={result.mmd:.6g}, "
         f"token_l2={result.token_l2:.6g}, "
-        f"jmq_win_rate={result.jmq_win_rate}"
+        f"jmq_win_rate={result.jmq_win_rate} "
+        f"(n={result.jmq_n}, window={result.jmq_window})"
     )
     json.dump(
         {
@@ -609,6 +622,10 @@ def _run_self_check(args: argparse.Namespace) -> int:
             "mmd": result.mmd,
             "token_l2": result.token_l2,
             "jmq_win_rate": result.jmq_win_rate,
+            # The effective scaled window and the valid-comparison count the
+            # win-rate was gated against, so the gate is auditable (CRITICAL 1).
+            "jmq_n": result.jmq_n,
+            "jmq_window": list(result.jmq_window) if result.jmq_window else None,
             "skip_jmq": args.skip_jmq,
         },
         sys.stdout,
