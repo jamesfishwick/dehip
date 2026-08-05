@@ -36,14 +36,17 @@ ALL_COMMANDS = sorted(cli.COMMANDS)
 
 # Commands still served by the shared stub. ``build-corpus`` (issue #5),
 # ``score`` (issue #10), ``generate`` (issue #12), ``self-check`` (issue #11),
-# and ``rewrite`` (issue #13) became real commands, so their handlers no longer
-# emit the {"status": "stub"} summary and are excluded from the stub-shape
-# assertions below (their behavior is covered by test_corpus.py,
-# test_score_cli.py, test_generate.py, test_self_check.py, and
-# test_cascade.py). Flag-rejection (argparse, pre-handler) still covers every
-# command. The rest remain stubs until their own tickets.
+# ``rewrite`` (issue #13), and ``report`` (issue #15) became real commands, so
+# their handlers no longer emit the {"status": "stub"} summary and are excluded
+# from the stub-shape assertions below (their behavior is covered by
+# test_corpus.py, test_score_cli.py, test_generate.py, test_self_check.py,
+# test_cascade.py, and test_report_comparison.py). Flag-rejection (argparse,
+# pre-handler) still covers every command. ``detect`` (issue #14) remains the
+# only stub until it lands. A sibling ticket makes ``detect`` real in parallel;
+# the merge resolves which set this holds.
 STUB_COMMANDS = sorted(
-    set(cli.COMMANDS) - {"build-corpus", "score", "generate", "self-check", "rewrite"}
+    set(cli.COMMANDS)
+    - {"build-corpus", "score", "generate", "self-check", "rewrite", "report"}
 )
 
 def _run_cli(argv):
