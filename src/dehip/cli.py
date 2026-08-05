@@ -363,6 +363,7 @@ def _run_rewrite(args: argparse.Namespace) -> int:
             run_id=run_id,
             requested_k=args.rounds,
             adapter_id=args.adapter,
+            seed=args.seed,
             printer=_progress,
         )
     except cascade_mod.HipRunError as exc:

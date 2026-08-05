@@ -55,6 +55,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from dehip.generate import (
     BUNDLES_FILENAME,
+    CorpusDriftError,
     _append_bundle,
     _read_all_bundles,
     _repair_torn_tail,
@@ -71,6 +72,7 @@ __all__ = [
     "HipPreconditionError",
     "HipRunError",
     "RoundsValidationError",
+    "CorpusDriftError",
     "HipRunner",
     "SubprocessHipRunner",
     "check_hip_precondition",
@@ -147,20 +149,27 @@ class HipRunner(Protocol):
         *,
         round_k: int,
         adapter_id: str,
+        seed: int = 0,
     ) -> dict[str, str]:
         """Return the rewrite of every input text for round ``round_k``.
 
-        The returned mapping must cover exactly the input pair_ids. Implementations
-        raise :class:`HipRunError` on any failure so the caller need not know how
-        the round was produced.
+        The returned mapping must cover exactly the input pair_ids. ``seed`` is the
+        harness-controlled seed passed through to ``hip-run`` for reproducibility.
+        Implementations raise :class:`HipRunError` on any failure so the caller
+        need not know how the round was produced.
         """
         ...
 
-    def config_for(self, *, round_k: int, adapter_id: str) -> dict[str, Any]:
-        """Return the emitted config for ``round_k``, inlined into the bundle audit.
+    def config_for(
+        self, *, round_k: int, adapter_id: str, seed: int
+    ) -> dict[str, Any]:
+        """Return the REQUESTED config for ``round_k``, inlined into the bundle audit.
 
         Recorded verbatim in each bundle's ``hip_config`` (data-model.md), so a
-        review can see exactly what was handed to ``hip-run`` for every round.
+        review can see exactly what config was HANDED TO ``hip-run`` for every
+        round -- including the ``seed`` the harness controls. This is the
+        requested config, advisory for any field ``hip-run`` may override at run
+        time; it is not a readback of what ``hip-run`` actually applied.
         """
         ...
 
@@ -192,13 +201,22 @@ class SubprocessHipRunner:
         self.base_model = base_model
         self.timeout_s = timeout_s
 
-    def config_for(self, *, round_k: int, adapter_id: str) -> dict[str, Any]:
-        """Build the per-round hip-run config (one round, one adapter)."""
+    def config_for(
+        self, *, round_k: int, adapter_id: str, seed: int
+    ) -> dict[str, Any]:
+        """Build the per-round hip-run config (one round, one adapter, one seed).
+
+        Records the ``seed`` the harness controls so a resumed/reproduced run has
+        a non-empty audit trail on the field that matters for reproducibility.
+        This is the REQUESTED config passed to ``hip-run``, advisory for fields
+        ``hip-run`` may override, not a readback of what it applied.
+        """
         return {
             "rounds": 1,
             "round": round_k,
             "adapter_id": adapter_id,
             "base_model": self.base_model,
+            "seed": seed,
         }
 
     def run_round(
@@ -207,6 +225,7 @@ class SubprocessHipRunner:
         *,
         round_k: int,
         adapter_id: str,
+        seed: int = 0,
     ) -> dict[str, str]:
         """Emit a config + JSONL, run one ``hip-run`` round, parse the JSONL back.
 
@@ -216,12 +235,20 @@ class SubprocessHipRunner:
         Every failure mode -- process error, unreadable/unparseable output, a
         pair the round did not rewrite, or a blank rewrite -- raises
         :class:`HipRunError` so nothing blank is ever returned as real text.
+
+        The per-round work dir is keyed on both the pair_id(s) and the round so
+        each pair's subprocess input/config/output persist for audit rather than
+        being overwritten by the next pair at the same round (NIT 1). The cascade
+        runs one pair per round, so the single pair_id namespaces the dir.
         """
         import yaml  # local import: only the real subprocess path needs pyyaml
 
-        round_dir = self.work_dir / f"round-{round_k}"
+        pair_tag = "-".join(_slug(pid) for pid in inputs) or "batch"
+        round_dir = self.work_dir / f"pair-{pair_tag}" / f"round-{round_k}"
         round_dir.mkdir(parents=True, exist_ok=True)
-        config = self.config_for(round_k=round_k, adapter_id=adapter_id)
+        config = self.config_for(
+            round_k=round_k, adapter_id=adapter_id, seed=seed
+        )
         config_path = round_dir / "config.yaml"
         input_path = round_dir / "input.jsonl"
         output_path = round_dir / "output.jsonl"
@@ -393,6 +420,7 @@ def _run_rounds_for_pair(
     runner: HipRunner,
     requested_k: int,
     adapter_id: str,
+    seed: int,
 ) -> RewriteBundle:
     """Run the k-round state machine for ONE pair; return the completed bundle.
 
@@ -410,8 +438,10 @@ def _run_rounds_for_pair(
        new good round, advance ``final_round`` to ``k``, and continue.
 
     Every intermediate round -- good or degenerate -- is kept in
-    ``bundle.rounds``. The bundle's ``hip_config`` inlines each round's emitted
-    config for audit, and ``degeneration`` records the last round's report so
+    ``bundle.rounds``. The bundle's ``hip_config`` inlines the REQUESTED config
+    handed to ``hip-run`` for each round (including the harness-controlled
+    ``seed``), advisory for any field ``hip-run`` may override -- not a readback
+    of what it applied. ``degeneration`` records the last round's report so
     ``hard_tripped`` flags the bundle.
     """
     assert bundle.draft is not None, "cascade requires a draft to rewrite from"
@@ -428,12 +458,13 @@ def _run_rounds_for_pair(
     last_report = DegenerationReport()  # a clean (no-op) report if k == 0
 
     for k in range(1, requested_k + 1):
-        config = runner.config_for(round_k=k, adapter_id=adapter_id)
+        config = runner.config_for(round_k=k, adapter_id=adapter_id, seed=seed)
         hip_configs.append(config)
         result = runner.run_round(
             {bundle.pair_id: prior_good_text},
             round_k=k,
             adapter_id=adapter_id,
+            seed=seed,
         )
         # The seam guarantees a non-blank text for the pair, but re-validate the
         # single-pair result so a stub seam is held to the same contract as the
@@ -476,7 +507,12 @@ def _run_rounds_for_pair(
         final_round=final_round,
         degeneration=_degeneration_to_dict(last_report),
         adapter_id=adapter_id,
-        hip_config={"rounds": hip_configs},
+        # hip_config is the REQUESTED config passed to hip-run (advisory for
+        # fields hip-run may override), not a readback of what it applied. The
+        # harness-controlled seed is recorded at the top level so the audit trail
+        # is non-empty on the reproducibility field that matters even for a bundle
+        # with zero rounds, and mirrored per-round in ``rounds`` (IMPORTANT 2).
+        hip_config={"seed": seed, "rounds": hip_configs},
         requested_k=requested_k,
         draft=bundle.draft,
     )
@@ -501,6 +537,42 @@ def _good_text_at_round(bundle: RewriteBundle, k: int) -> str | None:
     return None
 
 
+def _prune_stale_round_artifacts(run_dir: Path, *, requested_k: int) -> None:
+    """Remove ``rewrite-k*`` manifest + texts artifacts for ``k > requested_k``.
+
+    A prior run at a larger ``requested_k`` leaves per-round artifacts this
+    shorter run never rewrites; without pruning they linger and a downstream
+    consumer would read stale higher-k rewrites as part of this run (IMPORTANT 4).
+    Only artifacts strictly above the current ``requested_k`` are removed, so the
+    rounds this run does emit are never touched. Non-numeric or malformed
+    ``rewrite-k*`` names are left alone (not ours to interpret).
+    """
+    for manifest_path in run_dir.glob("rewrite-k*.manifest.json"):
+        k = _round_of_artifact(manifest_path.name, suffix=".manifest.json")
+        if k is not None and k > requested_k:
+            manifest_path.unlink()
+    for texts_path in run_dir.glob("rewrite-k*-texts.jsonl"):
+        k = _round_of_artifact(texts_path.name, suffix="-texts.jsonl")
+        if k is not None and k > requested_k:
+            texts_path.unlink()
+
+
+def _round_of_artifact(name: str, *, suffix: str) -> int | None:
+    """Parse the round ``k`` out of a ``rewrite-k{k}{suffix}`` artifact name.
+
+    Returns ``None`` for any name that does not match the exact
+    ``rewrite-k<int>{suffix}`` shape, so an unrelated or malformed file is left
+    untouched by the pruner rather than mis-parsed.
+    """
+    prefix = "rewrite-k"
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return None
+    middle = name[len(prefix) : len(name) - len(suffix)]
+    if not middle.isdigit():
+        return None
+    return int(middle)
+
+
 def _write_round_manifests(
     bundles: list[RewriteBundle],
     *,
@@ -519,7 +591,15 @@ def _write_round_manifests(
     draft-manifest convention ``report._texts_path_for`` resolves). A round with
     no surviving pairs (every pair hard-tripped before reaching it) is skipped,
     so no empty manifest is written.
+
+    Before writing, any stale higher-k artifacts from a prior run at a LARGER
+    ``requested_k`` are removed (IMPORTANT 4): completing at ``--rounds 3`` then
+    resuming at ``--rounds 2`` must not leave a ``rewrite-k3.manifest.json`` +
+    ``rewrite-k3-texts.jsonl`` that a downstream report/score could consume as if
+    round 3 were part of this run. Only ``k > requested_k`` artifacts are pruned;
+    the artifacts this run (re)writes are untouched.
     """
+    _prune_stale_round_artifacts(run_dir, requested_k=requested_k)
     manifests: list[TextSet] = []
     for k in range(1, requested_k + 1):
         members = [
@@ -567,6 +647,7 @@ def run_cascade(
     run_id: str,
     requested_k: int = DEFAULT_ROUNDS,
     adapter_id: str = DEFAULT_ADAPTER,
+    seed: int = 0,
     printer=print,
 ) -> dict[str, Any]:
     """Run the k-round cascade over every nascent bundle, resumable per pair.
@@ -594,6 +675,8 @@ def run_cascade(
         run_id: Run identifier recorded in every completed bundle + manifest.
         requested_k: Configured round count (validated 1..MAX_ROUNDS).
         adapter_id: HIP adapter id recorded in every bundle.
+        seed: Harness-controlled seed passed to ``hip-run`` and recorded in each
+            bundle's ``hip_config`` for the reproducibility audit trail.
         printer: Progress sink (stderr in the CLI).
 
     Returns:
@@ -646,6 +729,7 @@ def run_cascade(
             runner=runner,
             requested_k=requested_k,
             adapter_id=adapter_id,
+            seed=seed,
         )
         _append_bundle(completed, rewrite_path)
         rewritten += 1
@@ -653,6 +737,23 @@ def run_cascade(
     # Re-read the authoritative append-only file (tolerating a prior-run torn
     # tail) to assemble manifests deterministically and count flagged pairs.
     completed_bundles = _read_all_bundles(rewrite_path)
+
+    # Guard against corpus drift, mirroring generate.py exactly (IMPORTANT 1): a
+    # run dir holding rewrite bundles from a DIFFERENT/larger corpus carries
+    # pair_ids the current (nascent) input does not, which would otherwise be
+    # silently merged into the emitted manifests + texts, mislabeled and counted,
+    # exiting 0. The persisted rewrite-bundle pair_ids MUST be a subset of the
+    # nascent input pair_ids; a stray id fails loudly (CorpusDriftError -> exit 2),
+    # naming the strays, before any manifest is written.
+    input_ids = {b.pair_id for b in nascent_bundles}
+    stray = sorted({b.pair_id for b in completed_bundles} - input_ids)
+    if stray:
+        raise CorpusDriftError(
+            "rewrite bundles carry pair_ids absent from the input corpus "
+            f"(stale run dir?): {stray}. Refusing to merge them into the "
+            "manifest."
+        )
+
     # Order manifests by the input bundle order for determinism.
     order = {b.pair_id: i for i, b in enumerate(nascent_bundles)}
     completed_bundles.sort(key=lambda b: order.get(b.pair_id, len(order)))
@@ -684,6 +785,16 @@ def run_cascade(
     }
 
 
+def _slug(text: str) -> str:
+    """Filesystem-safe slug of a pair_id for a per-pair work dir (NIT 1).
+
+    Keeps alphanumerics, dash, and underscore; replaces every other character
+    with ``_`` so an arbitrary pair_id becomes a safe path segment without
+    colliding two distinct ids onto one dir under normal ``{corpus}-{seq}`` ids.
+    """
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in text)
+
+
 def _corpus_of(bundle: RewriteBundle) -> str:
     """Derive a bundle's corpus tag from its pair_id (``{corpus}-{seq}``).
 
@@ -701,22 +812,53 @@ def _load_done_rewrite_ids(rewrite_path: Path) -> tuple[set[str], int]:
     Reuses ``generate.py``'s tolerant :func:`_read_all_bundles` reader (skips a
     truncated final line from a crash mid-flush) so a completed bundle is
     "done": its pair is not re-run on resume. A pair whose bundle was torn is
-    absent here and gets re-run, overwriting nothing (append-only). Skipped-line
-    count is the difference between raw non-empty lines and parsed records.
+    absent here and gets re-run, overwriting nothing (append-only).
+
+    ``skipped`` is the count of lines that FAIL to parse in a tolerant pass, not
+    ``raw_nonempty - len(bundles)`` (IMPORTANT 3): ``_read_all_bundles`` de-dupes
+    a duplicate PARSEABLE pair_id (a regenerated pair whose prior line also
+    parsed), so the subtraction would wrongly inflate ``skipped`` and the CLI
+    message would claim a de-duped-but-durable pair "will be re-run" when it will
+    not. Counting real parse failures keeps ``skipped`` at exactly the
+    truncated/corrupt lines that force a re-run.
     """
     if not rewrite_path.exists():
         return set(), 0
-    raw_nonempty = sum(
-        1
-        for line in rewrite_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    )
     bundles = _read_all_bundles(rewrite_path)
     done = {b.pair_id for b in bundles}
-    # A duplicate pair_id (regenerated over a parseable stale line) is de-duped by
-    # _read_all_bundles, so skipped counts only unparseable/bad-version lines.
-    skipped = raw_nonempty - len(bundles)
-    return done, max(skipped, 0)
+    skipped = _count_unparseable_lines(rewrite_path)
+    return done, skipped
+
+
+def _count_unparseable_lines(rewrite_path: Path) -> int:
+    """Count non-empty rewrite-bundle lines that fail to parse (IMPORTANT 3).
+
+    A tolerant pass mirroring :func:`_read_all_bundles`'s per-line parse (same
+    JSON + schema-version + shape gate), counting exactly the lines that DO NOT
+    yield a valid bundle -- a truncated tail, a corrupt record, a wrong-version
+    line. A parseable duplicate pair_id is NOT counted (it parses fine; it is
+    merely de-duped downstream), so ``skipped`` never over-reports.
+    """
+    from dehip.generate import _bundle_from_raw
+    from dehip.schemas import SchemaValidationError, SchemaVersionError
+
+    unparseable = 0
+    with rewrite_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                _bundle_from_raw(json.loads(line))
+            except (
+                json.JSONDecodeError,
+                SchemaVersionError,
+                SchemaValidationError,
+                TypeError,
+                KeyError,
+            ):
+                unparseable += 1
+    return unparseable
 
 
 # --- Draft-file mode ---------------------------------------------------------
@@ -729,12 +871,14 @@ def bundles_from_draft_file(
 ) -> list[RewriteBundle]:
     """Synthesize nascent bundles from a draft JSONL, for rewrite-only mode.
 
-    Draft-file mode skips ``generate`` but must produce the IDENTICAL bundle
-    structure as run-continuation mode: each ``{pair_id, text[, prompt]}`` record
-    becomes a nascent :class:`~dehip.schemas.RewriteBundle` carrying that text as
-    its ``draft`` with an empty ``rounds`` list, so :func:`run_cascade` treats
-    both modes the same. The draft's ``model_id``/``sampling`` are recorded as
-    ``draft-file`` provenance since no model produced them here.
+    Draft-file mode skips ``generate`` but must produce the same round and
+    degeneration shape as run-continuation mode: each ``{pair_id, text[, prompt]}``
+    record becomes a nascent :class:`~dehip.schemas.RewriteBundle` carrying that
+    text as its ``draft`` with an empty ``rounds`` list, so :func:`run_cascade`
+    treats both modes the same. The two modes are NOT byte-identical by design:
+    the draft's ``model_id``/``sampling`` provenance is recorded as ``draft-file``
+    (no model produced these), so draft provenance differs while the rewrite
+    trajectory (rounds, ``final_round``, ``degeneration``) matches.
 
     Raises ``ValueError`` (-> CLI exit 2) on a missing/unreadable file, an
     unparseable line, or a record lacking ``pair_id``/``text``.

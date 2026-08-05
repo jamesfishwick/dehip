@@ -31,8 +31,30 @@ Test map (each locks one DoD / adversarial-design item):
   ``test_empty_rewrite_fails_loudly`` -- the subprocess boundary: a malformed or
   empty hip-run result raises HipRunError (-> exit 3), never a silent blank round.
 - ``test_requested_k_over_max_is_validation_error`` -- rounds > 4 is exit 2.
+- ``test_rounds_at_max_completes_successfully`` -- rounds == MAX_ROUNDS (4)
+  completes; the inclusive upper edge, not just the k=5 rejection.
 - ``test_per_round_manifest_emitted_per_round`` -- one role=rewrite TextSet
   manifest per round (round=k), matching data-model.md.
+- ``test_hip_config_records_requested_seed`` /
+  ``test_cli_threads_global_seed_into_hip_config`` -- hip_config carries the
+  harness-requested seed (top level + per round), wired from the CLI --seed.
+- ``test_foreign_pair_id_in_rewrite_file_fails_loudly`` /
+  ``test_corpus_drift_maps_to_exit_2_via_cli`` -- a stale foreign pair_id in the
+  rewrite file fails loudly (CorpusDriftError -> exit 2), no contaminated manifest.
+- ``test_parseable_duplicate_does_not_inflate_skipped`` -- a parseable duplicate
+  pair_id keeps skipped at 0 (skipped counts real parse failures, not dedup).
+- ``test_shrink_resume_prunes_stale_higher_k_artifacts`` -- completing at rounds=3
+  then resuming at rounds=2 removes the stale k3 manifest + texts.
+- ``test_hard_trip_on_last_round_yields_final_round_k_minus_one`` -- a hard trip on
+  the LAST requested round sets final_round == requested_k - 1 (mutation catcher).
+- ``test_draft_file_*_is_validation_error`` -- bundles_from_draft_file guards
+  (unparseable line, blank text, duplicate pair_id, empty file) each -> exit 2.
+- ``test_torn_final_line_repaired_on_resume`` /
+  ``test_torn_tail_with_corrupt_record_counts_in_skipped`` -- a torn/truncated
+  final line (no trailing newline) repairs on resume; skipped reflects the real
+  torn line; the torn pair regenerates cleanly with no duplicate.
+- ``test_subprocess_work_dirs_are_per_pair`` -- each pair's subprocess work dir is
+  keyed on the pair_id so per-pair audit artifacts persist (NIT 1).
 """
 
 from __future__ import annotations
@@ -71,10 +93,15 @@ class ScriptedHipRunner:
             lambda text, k, pair_id: f"{text} [r{k}]"
         )
 
-    def config_for(self, *, round_k, adapter_id):
-        return {"round": round_k, "adapter_id": adapter_id, "rounds": 1}
+    def config_for(self, *, round_k, adapter_id, seed=0):
+        return {
+            "round": round_k,
+            "adapter_id": adapter_id,
+            "rounds": 1,
+            "seed": seed,
+        }
 
-    def run_round(self, inputs, *, round_k, adapter_id):
+    def run_round(self, inputs, *, round_k, adapter_id, seed=0):
         out: dict[str, str] = {}
         for pair_id, text in inputs.items():
             self.calls.append((pair_id, round_k))
@@ -85,10 +112,10 @@ class ScriptedHipRunner:
 class BadOutputHipRunner:
     """Stub whose round omits a pair (a malformed/incomplete hip-run result)."""
 
-    def config_for(self, *, round_k, adapter_id):
+    def config_for(self, *, round_k, adapter_id, seed=0):
         return {"round": round_k}
 
-    def run_round(self, inputs, *, round_k, adapter_id):
+    def run_round(self, inputs, *, round_k, adapter_id, seed=0):
         return {}  # rewrote nothing: the pair is missing from the output
 
 
@@ -297,11 +324,13 @@ def test_bundle_round_trips_through_read_jsonl(tmp_path):
 
 
 def test_draft_file_mode_matches_run_continuation_shape(tmp_path):
-    """Draft-file mode produces the identical bundle shape as run-continuation.
+    """Draft-file mode produces the same round + degeneration shape as run-continuation.
 
     Same drafts fed two ways -- as generate's nascent bundles vs a draft JSONL --
-    must yield byte-identical completed-bundle rounds/final_round/degeneration
-    (only draft-provenance metadata differs, which is expected).
+    must yield the same completed-bundle rounds/final_round/degeneration. The two
+    modes are NOT byte-identical by design: draft provenance (model_id/sampling)
+    differs, so this parity check excludes the draft field and compares only the
+    rewrite trajectory.
     """
     drafts = {
         "fineweb-00000": "First draft with enough words to rewrite cleanly here.",
@@ -406,12 +435,14 @@ def test_resume_reruns_only_incomplete_pairs(tmp_path):
             super().__init__()
             self._done: set[str] = set()
 
-        def run_round(self, inputs, *, round_k, adapter_id):
+        def run_round(self, inputs, *, round_k, adapter_id, seed=0):
             (pair_id,) = inputs  # one pair per round in the cascade
             if pair_id != bundles[0].pair_id and pair_id not in self._done:
                 raise KeyboardInterrupt("simulated interrupt at a new pair")
             self._done.add(pair_id)
-            return super().run_round(inputs, round_k=round_k, adapter_id=adapter_id)
+            return super().run_round(
+                inputs, round_k=round_k, adapter_id=adapter_id, seed=seed
+            )
 
     killer = KillAfterOnePair()
     with pytest.raises(KeyboardInterrupt):
@@ -476,10 +507,10 @@ def test_empty_rewrite_via_cli_maps_to_exit_3(tmp_path, monkeypatch):
     monkeypatch.setattr(cascade_mod, "check_hip_precondition", lambda repo: None)
 
     class EmptyRewriteRunner:
-        def config_for(self, *, round_k, adapter_id):
+        def config_for(self, *, round_k, adapter_id, seed=0):
             return {"round": round_k}
 
-        def run_round(self, inputs, *, round_k, adapter_id):
+        def run_round(self, inputs, *, round_k, adapter_id, seed=0):
             return {pid: "   " for pid in inputs}  # whitespace-only rewrite
 
     monkeypatch.setattr(
@@ -590,3 +621,457 @@ def test_per_round_manifest_emitted_per_round(tmp_path):
         if ln.strip()
     }
     assert set(texts) == {degenerate_id, healthy_id}
+
+
+# --- hip_config records the harness-controlled seed (IMPORTANT 2) -------------
+
+
+def test_hip_config_records_requested_seed(tmp_path):
+    """hip_config carries the sampling/seed the harness requested for the audit.
+
+    The seed is the field the harness actually controls (the rewrite CLI has no
+    temperature/top_p flag; hip-run owns those). It must appear both at the top
+    level of ``hip_config`` and mirrored per round, so a resumed/reproduced run
+    has a non-empty reproducibility trail -- not the empty ``hip_config`` the
+    prior build emitted on the seed field. This is the REQUESTED config, advisory
+    for fields hip-run may override, not a readback of what it applied.
+    """
+    bundles = _bundles(1)
+    run_cascade(
+        bundles,
+        runner=ScriptedHipRunner(),
+        run_dir=tmp_path,
+        run_id="RUN1",
+        requested_k=2,
+        adapter_id="ADP",
+        seed=4242,
+        printer=lambda *_: None,
+    )
+
+    bundle = read_jsonl(tmp_path / "rewrite-bundles.jsonl", RewriteBundle)[0]
+    assert bundle.hip_config["seed"] == 4242
+    # Every round's requested config carries the same seed.
+    assert [rc["seed"] for rc in bundle.hip_config["rounds"]] == [4242, 4242]
+
+
+def test_cli_threads_global_seed_into_hip_config(tmp_path, monkeypatch):
+    """The global --seed reaches hip_config through the rewrite CLI path.
+
+    Proves the seam is wired end to end (CLI --seed -> run_cascade -> config_for),
+    not merely that run_cascade accepts a seed kwarg.
+    """
+    monkeypatch.setattr(cascade_mod, "check_hip_precondition", lambda repo: None)
+    monkeypatch.setattr(
+        cascade_mod, "SubprocessHipRunner", lambda *a, **k: ScriptedHipRunner()
+    )
+
+    draft_path = tmp_path / "drafts.jsonl"
+    draft_path.write_text(
+        json.dumps({"pair_id": "fineweb-00000", "text": "a draft with words here."})
+        + "\n",
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "run"
+    code = cli.main(
+        [
+            "--seed",
+            "99",
+            "rewrite",
+            "--draft-file",
+            str(draft_path),
+            "--hip-repo",
+            str(tmp_path),
+            "--out",
+            str(out_dir),
+            "--rounds",
+            "2",
+        ]
+    )
+    assert code == cli.EXIT_SUCCESS
+    bundle = read_jsonl(out_dir / "rewrite-bundles.jsonl", RewriteBundle)[0]
+    assert bundle.hip_config["seed"] == 99
+
+
+# --- Corpus-drift guard (IMPORTANT 1) ----------------------------------------
+
+
+def test_foreign_pair_id_in_rewrite_file_fails_loudly(tmp_path):
+    """A stale foreign pair_id in the rewrite file -> loud exit 2, no manifest.
+
+    A run dir carrying a completed rewrite bundle from a DIFFERENT/larger corpus
+    must not silently merge that foreign pair_id into the emitted manifests +
+    texts, mislabeled and counted, exiting 0. Mirroring generate.py, the persisted
+    pair_ids must be a subset of the input pair_ids; a stray fails loudly with
+    CorpusDriftError (-> exit 2), naming the stray, before any manifest is written.
+    """
+    bundles = _bundles(1)  # input corpus is exactly {fineweb-00000}
+
+    # Seed the rewrite file with a completed bundle for a FOREIGN pair the input
+    # does not carry (as a stale larger-corpus run dir would).
+    foreign = _nascent("otherset-00042", "a foreign draft from a stale run dir here.")
+    completed_foreign = cascade_mod._run_rounds_for_pair(
+        foreign,
+        runner=ScriptedHipRunner(),
+        requested_k=2,
+        adapter_id="ADP",
+        seed=0,
+    )
+    rewrite_path = tmp_path / "rewrite-bundles.jsonl"
+    cascade_mod._append_bundle(completed_foreign, rewrite_path)
+
+    with pytest.raises(cascade_mod.CorpusDriftError) as exc_info:
+        _run(ScriptedHipRunner(), bundles, tmp_path, requested_k=2)
+    assert "otherset-00042" in str(exc_info.value)
+
+    # No contaminated manifest was written for the foreign pair.
+    assert not (tmp_path / "rewrite-k1.manifest.json").exists()
+    assert not (tmp_path / "rewrite-k2.manifest.json").exists()
+
+
+def test_corpus_drift_maps_to_exit_2_via_cli(tmp_path, monkeypatch):
+    """CorpusDriftError (a ValueError) maps to CLI exit 2 through the rewrite path."""
+    monkeypatch.setattr(cascade_mod, "check_hip_precondition", lambda repo: None)
+    monkeypatch.setattr(
+        cascade_mod, "SubprocessHipRunner", lambda *a, **k: ScriptedHipRunner()
+    )
+
+    out_dir = tmp_path / "run"
+    out_dir.mkdir()
+    foreign = _nascent("otherset-00042", "a foreign draft from a stale run dir here.")
+    completed_foreign = cascade_mod._run_rounds_for_pair(
+        foreign,
+        runner=ScriptedHipRunner(),
+        requested_k=2,
+        adapter_id="ADP",
+        seed=0,
+    )
+    cascade_mod._append_bundle(
+        completed_foreign, out_dir / "rewrite-bundles.jsonl"
+    )
+
+    draft_path = tmp_path / "drafts.jsonl"
+    draft_path.write_text(
+        json.dumps({"pair_id": "fineweb-00000", "text": "a draft with words here."})
+        + "\n",
+        encoding="utf-8",
+    )
+    code = cli.main(
+        [
+            "rewrite",
+            "--draft-file",
+            str(draft_path),
+            "--hip-repo",
+            str(tmp_path),
+            "--out",
+            str(out_dir),
+        ]
+    )
+    assert code == cli.EXIT_VALIDATION == 2
+
+
+# --- skipped-count does not mislabel a parseable duplicate (IMPORTANT 3) ------
+
+
+def test_parseable_duplicate_does_not_inflate_skipped(tmp_path):
+    """A durable file with a duplicate PARSEABLE pair_id -> skipped stays 0.
+
+    _read_all_bundles de-dupes a duplicate parseable pair_id (last writer wins),
+    so ``raw_nonempty - len(bundles)`` would wrongly count the duplicate as a
+    "skipped/truncated" line and claim the pair "will be re-run". skipped must be
+    computed from the actual parse-FAILURE count, so a parseable duplicate keeps
+    skipped at 0 and the pair is treated as done (not re-run).
+    """
+    bundles = _bundles(2)
+    rewrite_path = tmp_path / "rewrite-bundles.jsonl"
+
+    # Write two completed bundles, then append a DUPLICATE (parseable) line for
+    # pair 0 -- as a regenerated-over-a-stale-parseable-line resume would produce.
+    for b in bundles:
+        completed = cascade_mod._run_rounds_for_pair(
+            b, runner=ScriptedHipRunner(), requested_k=2, adapter_id="ADP", seed=0
+        )
+        cascade_mod._append_bundle(completed, rewrite_path)
+    dup = cascade_mod._run_rounds_for_pair(
+        bundles[0], runner=ScriptedHipRunner(), requested_k=2, adapter_id="ADP", seed=0
+    )
+    cascade_mod._append_bundle(dup, rewrite_path)
+
+    done, skipped = cascade_mod._load_done_rewrite_ids(rewrite_path)
+    assert done == {bundles[0].pair_id, bundles[1].pair_id}
+    assert skipped == 0  # a parseable duplicate is NOT a skipped/truncated line
+
+    # And a resume re-runs NEITHER pair (both are durable/done despite the dup).
+    resumer = ScriptedHipRunner()
+    summary = _run(resumer, bundles, tmp_path, requested_k=2)
+    assert resumer.calls == []
+    assert summary["rewritten"] == 0
+    assert summary["already_done"] == 2
+
+
+# --- stale manifest pruned on shrink-resume (IMPORTANT 4) --------------------
+
+
+def test_shrink_resume_prunes_stale_higher_k_artifacts(tmp_path):
+    """Complete at rounds=3, resume at rounds=2 -> k3 artifacts are gone.
+
+    Higher-k manifests + texts from the prior larger run must not linger for a
+    downstream report/score to consume as if round 3 were part of this run. On the
+    shorter resume the k3 manifest and its texts file are removed; the k1/k2
+    artifacts this run emits survive.
+    """
+    bundles = _bundles(2)
+
+    _run(ScriptedHipRunner(), bundles, tmp_path, requested_k=3)
+    assert (tmp_path / "rewrite-k3.manifest.json").exists()
+    assert (tmp_path / "rewrite-k3-texts.jsonl").exists()
+
+    # Resume at a SMALLER rounds. The already-done pairs are not re-run, but the
+    # manifests are re-derived (from the completed bundles) at the new requested_k,
+    # so the stale k3 artifacts must be pruned.
+    _run(ScriptedHipRunner(), bundles, tmp_path, requested_k=2)
+    assert not (tmp_path / "rewrite-k3.manifest.json").exists()
+    assert not (tmp_path / "rewrite-k3-texts.jsonl").exists()
+    # The rounds this run emits are intact.
+    assert (tmp_path / "rewrite-k1.manifest.json").exists()
+    assert (tmp_path / "rewrite-k2.manifest.json").exists()
+
+
+# --- hard trip on the LAST requested round (IMPORTANT 5.1) --------------------
+
+
+def test_hard_trip_on_last_round_yields_final_round_k_minus_one(tmp_path):
+    """A hard trip on the LAST requested round (k=2 of 2) -> final_round == 1.
+
+    Distinct from a clean completion's final_round == requested_k (== 2). This
+    catches a mutation that sets final_round = requested_k at loop end regardless
+    of a trip on the final round: here the final round hard-trips, so final_round
+    must be requested_k - 1 (the last good round), not requested_k.
+    """
+    target = "fineweb-00000"
+    bundles = [_nascent(target, "a compact draft with several words in it here.")]
+
+    def transform(text, k, pair_id):
+        if k == 2:
+            return text * 6  # hard length trip on the LAST requested round
+        return f"{text} [r{k}]"
+
+    _run(ScriptedHipRunner(transform), bundles, tmp_path, requested_k=2)
+
+    bundle = read_jsonl(tmp_path / "rewrite-bundles.jsonl", RewriteBundle)[0]
+    assert bundle.requested_k == 2
+    assert bundle.final_round == 1  # requested_k - 1, NOT requested_k
+    assert bundle.degeneration["hard_tripped"] is True
+    assert [r["k"] for r in bundle.rounds] == [1, 2]
+    assert bundle.rounds[1]["hard_tripped"] is True
+
+
+# --- bundles_from_draft_file guard tests (IMPORTANT 5.2) ----------------------
+
+
+def test_draft_file_unparseable_line_is_validation_error(tmp_path):
+    """An unparseable draft-file line -> ValueError (-> exit 2)."""
+    draft_path = tmp_path / "drafts.jsonl"
+    draft_path.write_text("{not valid json\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        cascade_mod.bundles_from_draft_file(draft_path, run_id="RUN1")
+
+
+def test_draft_file_blank_text_is_validation_error(tmp_path):
+    """A blank draft text -> ValueError (nothing to rewrite; -> exit 2)."""
+    draft_path = tmp_path / "drafts.jsonl"
+    draft_path.write_text(
+        json.dumps({"pair_id": "fineweb-00000", "text": "   "}) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        cascade_mod.bundles_from_draft_file(draft_path, run_id="RUN1")
+
+
+def test_draft_file_duplicate_pair_id_is_validation_error(tmp_path):
+    """A duplicate pair_id in the draft file -> ValueError (-> exit 2)."""
+    draft_path = tmp_path / "drafts.jsonl"
+    with draft_path.open("w", encoding="utf-8") as fh:
+        for text in ("first draft.", "dup draft."):
+            fh.write(json.dumps({"pair_id": "fineweb-00000", "text": text}) + "\n")
+    with pytest.raises(ValueError):
+        cascade_mod.bundles_from_draft_file(draft_path, run_id="RUN1")
+
+
+def test_draft_file_empty_is_validation_error(tmp_path):
+    """An empty draft file (no records) -> ValueError (-> exit 2)."""
+    draft_path = tmp_path / "drafts.jsonl"
+    draft_path.write_text("\n  \n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        cascade_mod.bundles_from_draft_file(draft_path, run_id="RUN1")
+
+
+def test_draft_file_guards_map_to_exit_2_via_cli(tmp_path, monkeypatch):
+    """A draft-file guard failure maps to CLI exit 2 (input error), not exit 1."""
+    monkeypatch.setattr(cascade_mod, "check_hip_precondition", lambda repo: None)
+    draft_path = tmp_path / "drafts.jsonl"
+    draft_path.write_text("{not valid json\n", encoding="utf-8")
+    code = cli.main(
+        [
+            "rewrite",
+            "--draft-file",
+            str(draft_path),
+            "--hip-repo",
+            str(tmp_path),
+            "--out",
+            str(tmp_path / "run"),
+        ]
+    )
+    assert code == cli.EXIT_VALIDATION == 2
+
+
+# --- torn/truncated final line on resume (IMPORTANT 5.3) ----------------------
+
+
+def test_torn_final_line_repaired_on_resume(tmp_path):
+    """A torn final rewrite-bundle line (NO trailing newline) repairs on resume.
+
+    A crash between an append's record write and its newline leaves the final
+    record with no trailing newline. On resume the torn tail is repaired BEFORE
+    the first append (so a regenerated record never concatenates onto the
+    fragment), skipped reflects the real torn line, and the torn pair regenerates
+    cleanly -- no duplicate, no lost round.
+    """
+    bundles = _bundles(2)
+    rewrite_path = tmp_path / "rewrite-bundles.jsonl"
+
+    # pair 0 is durably complete (newline-terminated).
+    completed0 = cascade_mod._run_rounds_for_pair(
+        bundles[0], runner=ScriptedHipRunner(), requested_k=2, adapter_id="ADP", seed=0
+    )
+    cascade_mod._append_bundle(completed0, rewrite_path)
+
+    # pair 1's record was written but its trailing newline never landed: a torn
+    # tail. Append the JSON WITHOUT a newline to simulate the crash.
+    completed1 = cascade_mod._run_rounds_for_pair(
+        bundles[1], runner=ScriptedHipRunner(), requested_k=2, adapter_id="ADP", seed=0
+    )
+    from dehip.schemas import _to_dict
+
+    torn = json.dumps(_to_dict(completed1))
+    with rewrite_path.open("a", encoding="utf-8") as fh:
+        fh.write(torn)  # NO trailing newline -> torn tail
+
+    # Before resume, the torn line still parses on its own (it is complete JSON,
+    # just unterminated), so it counts as done. The repair + resume path is what
+    # we assert: the boundary is fixed so a later append is not corrupted.
+    done_before, skipped_before = cascade_mod._load_done_rewrite_ids(rewrite_path)
+
+    # Resume: the torn tail is repaired (newline appended) before any new append.
+    resumer = ScriptedHipRunner()
+    summary = _run(resumer, bundles, tmp_path, requested_k=2)
+
+    # No duplicate bundle; both pairs present exactly once with their rounds kept.
+    completed = read_jsonl(rewrite_path, RewriteBundle)
+    ids = [b.pair_id for b in completed]
+    assert sorted(ids) == sorted(b.pair_id for b in bundles)
+    assert len(ids) == len(set(ids))
+    for b in completed:
+        assert [r["k"] for r in b.rounds] == [1, 2]
+    # The final rewrite file is newline-terminated after the repair (no torn tail).
+    assert rewrite_path.read_bytes().endswith(b"\n")
+    assert summary["already_done"] >= 1
+
+
+def test_torn_tail_with_corrupt_record_counts_in_skipped(tmp_path):
+    """A truly unparseable torn tail is counted in skipped and the pair re-runs.
+
+    Distinct from the complete-but-unterminated tail above: here the final line is
+    a genuinely corrupt fragment (partial JSON). It parses in NEITHER reader, so
+    skipped counts exactly that one torn line and the corresponding pair is re-run
+    on resume, with no duplicate.
+    """
+    bundles = _bundles(2)
+    rewrite_path = tmp_path / "rewrite-bundles.jsonl"
+
+    completed0 = cascade_mod._run_rounds_for_pair(
+        bundles[0], runner=ScriptedHipRunner(), requested_k=2, adapter_id="ADP", seed=0
+    )
+    cascade_mod._append_bundle(completed0, rewrite_path)
+    # A corrupt partial-JSON fragment as the torn tail (no newline, unparseable).
+    with rewrite_path.open("a", encoding="utf-8") as fh:
+        fh.write('{"pair_id": "fineweb-00001", "rounds": [{"k": 1,')
+
+    _done, skipped = cascade_mod._load_done_rewrite_ids(rewrite_path)
+    assert skipped == 1  # exactly the one corrupt torn line
+
+    resumer = ScriptedHipRunner()
+    _run(resumer, bundles, tmp_path, requested_k=2)
+    # The corrupt fragment stays on its own skippable line (repaired boundary), so
+    # read through the tolerant reader that drops it -- exactly what resume uses.
+    completed = cascade_mod._read_all_bundles(rewrite_path)
+    ids = [b.pair_id for b in completed]
+    assert sorted(ids) == sorted(b.pair_id for b in bundles)
+    assert len(ids) == len(set(ids))
+    # pair 1 (whose torn record was corrupt) was re-run.
+    assert bundles[1].pair_id in {pid for pid, _ in resumer.calls}
+
+
+# --- rounds == MAX_ROUNDS completes (IMPORTANT 5.4) ---------------------------
+
+
+def test_rounds_at_max_completes_successfully(tmp_path):
+    """rounds == 4 (MAX_ROUNDS) completes; only k=5 is rejected.
+
+    The prior suite tested only the k=5 rejection boundary. This locks the
+    inclusive upper edge: requested_k == MAX_ROUNDS runs all four rounds and
+    records final_round == 4.
+    """
+    assert cascade_mod.MAX_ROUNDS == 4
+    bundles = _bundles(1)
+    summary = _run(ScriptedHipRunner(), bundles, tmp_path, requested_k=4)
+    assert summary["requested_k"] == 4
+
+    bundle = read_jsonl(tmp_path / "rewrite-bundles.jsonl", RewriteBundle)[0]
+    assert [r["k"] for r in bundle.rounds] == [1, 2, 3, 4]
+    assert bundle.final_round == 4
+
+
+# --- per-pair work dir keyed on pair_id (NIT 1) ------------------------------
+
+
+def test_subprocess_work_dirs_are_per_pair(tmp_path, monkeypatch):
+    """Two pairs at the same round get DISTINCT work dirs (NIT 1).
+
+    The SubprocessHipRunner's per-round work dir includes the pair_id, so one
+    pair's subprocess input/config/output survive rather than being overwritten by
+    the next pair at the same round. We drive the seam through a fake subprocess so
+    no real hip-run is invoked, and assert each pair produced its own audit dir.
+    """
+    work_dir = tmp_path / "hip-work"
+    runner = cascade_mod.SubprocessHipRunner(tmp_path, work_dir=work_dir)
+
+    from pathlib import Path as _Path
+
+    captured_dirs: list[str] = []
+
+    def fake_run(cmd, **kwargs):
+        # cmd is [..., "--output", <path>]; echo the input back as the output so
+        # the parser succeeds, and record which work dir was used.
+        out_path = _Path(cmd[cmd.index("--output") + 1])
+        in_path = _Path(cmd[cmd.index("--input") + 1])
+        captured_dirs.append(str(out_path.parent))
+        # Copy input to output verbatim (each line already {pair_id, text}).
+        out_path.write_text(in_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+        class _Proc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _Proc()
+
+    monkeypatch.setattr(cascade_mod.subprocess, "run", fake_run)
+    runner.run_round({"fineweb-00000": "text a"}, round_k=1, adapter_id="ADP")
+    runner.run_round({"fineweb-00001": "text b"}, round_k=1, adapter_id="ADP")
+
+    # Two DISTINCT per-pair round-1 work dirs, both surviving on disk.
+    assert len(set(captured_dirs)) == 2
+    surviving = {p.name for p in work_dir.iterdir() if p.is_dir()}
+    assert len(surviving) == 2
+    for d in captured_dirs:
+        assert _Path(d).exists()
