@@ -105,3 +105,5 @@ dehip report --draft-report R1.json --rewrite-report R2.json [...more rewrite re
 | 2 | validation failure (bad inputs, mismatched sets, N below floor without override) |
 | 3 | external dependency failure (HIP checkout, API auth) |
 | 4 | self-check out of bounds |
+| 5 | artifact write failure (report/detection I/O) |
+| 6 | detect: SC-005 delta not computed on a comparison run (paid, no decision) |
