@@ -1,24 +1,56 @@
-# dehip task runner. Recipes are documented stubs until Phase 0 lands;
-# each echoes the command sequence it will eventually run.
+# dehip task runner. Recipes drive the real dehip CLI (src/dehip/cli.py) and
+# the HIP sibling checkout. See specs/001-hip-cascade-harness/quickstart.md for
+# the narrated walkthrough and the prerequisites each recipe needs (uv, an
+# OPENAI_API_KEY for the judge, the HIP checkout, and downloaded models).
 
 hip_repo := "https://github.com/YixuanEvenXu/humanization-by-iterative-paraphrasing"
+hip_dir := "../humanization-by-iterative-paraphrasing"
+
+# Fixed smoke-run layout so smoke-test's steps chain deterministically. A real
+# `dehip generate`/`rewrite` run mints a timestamp run_id when --out is omitted;
+# pinning --out here lets each later step name the manifest the prior step wrote.
+smoke_corpus := "data/corpus/fineweb-smoke.jsonl"
+smoke_manifest := "data/corpus/fineweb-smoke.manifest.json"
+smoke_run := "results/runs/smoke"
 
 default:
     @just --list
 
-# Clone the HIP training/inference/eval code alongside this repo
+# The cascade's `dehip rewrite` shells out to `uv run hip-run` in this checkout.
+# Clone the HIP sibling checkout next to this repo and install its deps.
 clone-hip:
-    @echo "git clone {{hip_repo}} ../humanization-by-iterative-paraphrasing"
+    git clone {{hip_repo}} {{hip_dir}}
+    cd {{hip_dir}} && uv sync
 
-# Fetch a released HIP LoRA adapter (size: 0.6B, 1.7B, 4B, 8B, 14B)
-fetch-adapter size="0.6B":
-    @echo "hf download YixuanEvenXu/Qwen3-{{size}}-Base-HIP-adapter --local-dir adapters/Qwen3-{{size}}-Base-HIP-adapter"
+# The adapter id matches `dehip rewrite --adapter`; 4B is the harness default.
+# Example: `just fetch-adapter size=0.6B` or `just fetch-adapter size=4B`.
+# Fetch a released HIP LoRA adapter by size (0.6B, 1.7B, 4B, 8B, 14B).
+fetch-adapter size="4B":
+    uv run hf download YixuanEvenXu/Qwen3-{{size}}-Base-HIP-adapter \
+        --local-dir adapters/Qwen3-{{size}}-Base-HIP-adapter
 
-# Phase 0 smoke test: one prompt through the instruct -> HIP cascade
+# Prove the harness against itself, generate drafts, rewrite k=2, score, compare.
+# Runs the quickstart end to end. Needs the prerequisites above (keys, HIP
+# checkout, models); the recipe is the real command sequence, not a claim it has
+# been run on real models.
+# Run the quickstart smoke sequence end to end.
 smoke-test:
-    @echo "TODO Phase 0: generate with a Qwen3 instruct model, paraphrase k=2 rounds with the fetched adapter, print before/after"
-    @echo "See pipeline/README.md"
+    uv sync
+    uv run dehip --seed 42 build-corpus --tier smoke --corpus fineweb \
+        --out {{smoke_corpus}}
+    uv run dehip self-check --reference {{smoke_manifest}} --skip-jmq
+    uv run dehip --seed 42 generate --corpus {{smoke_corpus}} --out {{smoke_run}}
+    uv run dehip rewrite --run {{smoke_run}} --rounds 2 --hip-repo {{hip_dir}}
+    uv run dehip score --candidate {{smoke_run}}/draft.manifest.json \
+        --reference {{smoke_manifest}} --prompts {{smoke_corpus}} --yes \
+        --out results/reports/smoke-draft.json
+    uv run dehip score --candidate {{smoke_run}}/rewrite-k2.manifest.json \
+        --reference {{smoke_manifest}} --prompts {{smoke_corpus}} --yes \
+        --out results/reports/smoke-rewrite-k2.json
+    uv run dehip report --draft-report results/reports/smoke-draft.json \
+        --rewrite-report results/reports/smoke-rewrite-k2.json --benchmark \
+        --out results/reports/smoke-comparison.json
 
-# No-op formatter target mirror (real one is in the Makefile for the pre-commit hook)
+# No-op formatter mirror; real one is in the Makefile for the pre-commit hook.
 format:
     @true
