@@ -34,18 +34,26 @@ VALID_INVOCATIONS = {
 
 ALL_COMMANDS = sorted(cli.COMMANDS)
 
-# Commands still served by the shared stub. ``build-corpus`` (issue #5),
-# ``score`` (issue #10), ``generate`` (issue #12), ``self-check`` (issue #11),
-# ``rewrite`` (issue #13), and ``detect`` (issue #14) became real commands, so
-# their handlers no longer emit the {"status": "stub"} summary and are excluded
-# from the stub-shape assertions below (their behavior is covered by
-# test_corpus.py, test_score_cli.py, test_generate.py, test_self_check.py,
-# test_cascade.py, and test_detector.py). Flag-rejection (argparse, pre-handler)
-# still covers every command. ``report`` remains a stub until issue #15.
-STUB_COMMANDS = sorted(
+# Every subcommand is now a real command (build-corpus #5, score #10,
+# generate #12, self-check #11, rewrite #13, detect #14, report #15): none emits
+# the {"status": "stub"} summary any more, so their behavior is covered by their
+# own test files (test_corpus.py, test_score_cli.py, test_generate.py,
+# test_self_check.py, test_cascade.py, test_detector.py, test_report_comparison.py).
+# The stub-shape assertions that used to parametrize over STUB_COMMANDS are
+# retired; the flag-rejection test below still covers every command via
+# ALL_COMMANDS. No stub commands remain.
+STUB_COMMANDS: list[str] = sorted(
     set(cli.COMMANDS)
-    - {"build-corpus", "score", "generate", "self-check", "rewrite", "detect"}
-)
+    - {
+        "build-corpus",
+        "score",
+        "generate",
+        "self-check",
+        "rewrite",
+        "detect",
+        "report",
+    }
+)  # == [] ; kept as an explicit assertion that nothing is a stub.
 
 def _run_cli(argv):
     """Run the CLI as a subprocess so stdout/stderr are cleanly separated."""
@@ -86,34 +94,11 @@ def test_unknown_flag_rejected_with_exit_2(command):
     assert result.returncode == cli.EXIT_VALIDATION == 2
 
 
-@pytest.mark.parametrize("command", STUB_COMMANDS)
-def test_stdout_is_json_on_its_own(command):
-    result = _run_cli(VALID_INVOCATIONS[command])
-    assert result.returncode == cli.EXIT_SUCCESS == 0
-    # stdout must parse as JSON with nothing else mixed in (progress on stderr).
-    summary = json.loads(result.stdout)
-    assert summary["command"] == command
-    assert summary["status"] == "stub"
-    # Progress output goes to stderr, not stdout.
-    assert result.stderr.strip() != ""
-
-
-@pytest.mark.parametrize("command", STUB_COMMANDS)
-def test_seed_appears_in_summary(command):
-    argv = ["--seed", "4242", *VALID_INVOCATIONS[command]]
-    result = _run_cli(argv)
-    assert result.returncode == 0
-    summary = json.loads(result.stdout)
-    assert summary["seed"] == 4242
-
-
-def test_default_seed_recorded():
-    # Most commands are no longer stubs (issues #5/#10/#11/#12/#13/#14); use the
-    # remaining stub command (report, issue #15).
-    summary = _run_json(
-        ["report", "--draft-report", "draft.json", "--rewrite-report", "rw.json"]
-    )
-    assert summary["seed"] == 0
+def test_no_stub_commands_remain():
+    # Every subcommand is real now; none emits the {"status": "stub"} summary.
+    # Per-command behavior (including seed recording) is covered by each
+    # command's own test file. This replaces the old stub-shape assertions.
+    assert STUB_COMMANDS == []
 
 
 def test_no_subcommand_exits_2():

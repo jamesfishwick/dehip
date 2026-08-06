@@ -56,12 +56,14 @@ class ScriptedJudge:
 # --- Manifest / texts fixtures -----------------------------------------------
 
 
-def _write_manifest(tmp_path, name, set_id, role, pair_ids, texts_by_id):
+def _write_manifest(
+    tmp_path, name, set_id, role, pair_ids, texts_by_id, corpus="fineweb"
+):
     """Write a TextSet manifest + its sibling {pair_id, text} JSONL."""
     manifest = TextSet(
         set_id=set_id,
         role=role,
-        corpus="fineweb",
+        corpus=corpus,
         pair_ids=pair_ids,
         provenance={"texts_path": f"{name}.jsonl"},
     )
@@ -73,16 +75,16 @@ def _write_manifest(tmp_path, name, set_id, role, pair_ids, texts_by_id):
     return str(manifest_path)
 
 
-def _corpus(tmp_path, n):
+def _corpus(tmp_path, n, corpus="fineweb"):
     pair_ids = [f"fineweb-{i}" for i in range(n)]
     cand = {pid: f"model output {i} words here" for i, pid in enumerate(pair_ids)}
     ref = {pid: f"human reference {i} words here" for i, pid in enumerate(pair_ids)}
     prompts = {pid: f"prompt {i}" for i, pid in enumerate(pair_ids)}
     cand_manifest = _write_manifest(
-        tmp_path, "cand", "cand-set", "instruct_draft", pair_ids, cand
+        tmp_path, "cand", "cand-set", "instruct_draft", pair_ids, cand, corpus=corpus
     )
     ref_manifest = _write_manifest(
-        tmp_path, "ref", "ref-set", "human_reference", pair_ids, ref
+        tmp_path, "ref", "ref-set", "human_reference", pair_ids, ref, corpus=corpus
     )
     prompts_path = tmp_path / "prompts.jsonl"
     with prompts_path.open("w", encoding="utf-8") as fh:
@@ -147,6 +149,39 @@ def test_cli_score_composes_report(tmp_path, monkeypatch):
     assert (tmp_path / "report.md").exists()
     # Bias audit present.
     assert "bias_audit" in written["jmq"]
+
+
+def test_cli_score_report_carries_compared_corpus(tmp_path, monkeypatch):
+    """IMPORTANT 2(a): a report from the REAL score path records its corpus.
+
+    The FR-010 benchmark gate must have its primary signal -- compared["corpus"]
+    -- populated on real reports, not only the set-id naming fallback. The corpus
+    is threaded from the candidate TextSet through MetricInputs and score() into
+    the report, so a run over a "personal" corpus lands as compared["corpus"] ==
+    "personal" without any hand-stamping.
+    """
+    cand, ref, prompts = _corpus(tmp_path, 4, corpus="personal")
+    _patch_seams(monkeypatch)
+    out = tmp_path / "report.json"
+
+    rc = cli.main(
+        [
+            "score",
+            "--candidate",
+            cand,
+            "--reference",
+            ref,
+            "--prompts",
+            prompts,
+            "--out",
+            str(out),
+            "--yes",
+        ]
+    )
+    assert rc == cli.EXIT_SUCCESS
+
+    written = json.loads(out.read_text())
+    assert written["compared"]["corpus"] == "personal"
 
 
 def test_cli_metric_subset(tmp_path, monkeypatch):

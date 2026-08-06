@@ -57,6 +57,13 @@ __all__ = [
     "render_markdown",
     "load_scoring_inputs",
     "report_to_jsonable",
+    "PERSONAL_CORPUS",
+    "COMPARISON_METRICS",
+    "PersonalCorpusBenchmarkError",
+    "report_corpus",
+    "metric_delta",
+    "assemble_comparison",
+    "render_comparison",
 ]
 
 # Documented small-N floor for the caveat. Distinct from validate's DEFAULT_MIN_N
@@ -79,13 +86,17 @@ class MetricInputs:
     validated identical). ``candidate_texts`` and ``reference_texts`` map each
     pair_id to its text (model output and human reference respectively).
     ``prompts`` maps each pair_id to the originating prompt, needed by JMQ; it may
-    be omitted when JMQ is not requested.
+    be omitted when JMQ is not requested. ``corpus`` is the homogeneous corpus tag
+    of the scored sets (read from the candidate ``TextSet``); it is threaded into
+    the report's ``compared["corpus"]`` so the FR-010 benchmark gate has the
+    primary corpus signal on real reports, not only the set-id naming fallback.
     """
 
     pair_ids: Sequence[str]
     candidate_texts: dict[str, str]
     reference_texts: dict[str, str]
     prompts: dict[str, str] | None = None
+    corpus: str | None = None
 
 
 def _now_iso() -> str:
@@ -242,12 +253,16 @@ def load_scoring_inputs(
         # untouched and cannot false-positive.
         _assert_ids_match("pair_ids", cand_ids, "prompts", prompts.keys())
 
+    # The candidate TextSet's homogeneous corpus tag is the run's corpus; carry
+    # it so score() can stamp compared["corpus"] and the FR-010 gate has its
+    # primary signal on real reports (not only the set-id naming fallback).
     return (
         MetricInputs(
             pair_ids=cand_ids,
             candidate_texts=candidate_texts,
             reference_texts=reference_texts,
             prompts=prompts,
+            corpus=cand_set.corpus,
         ),
         cand_set.set_id,
         ref_set.set_id,
@@ -433,6 +448,7 @@ def assemble_report(
     thresholds: dict[str, Any] | None = None,
     started: str | None = None,
     finished: str | None = None,
+    corpus: str | None = None,
 ) -> MetricReport:
     """Compose computed metric values into one :class:`MetricReport`.
 
@@ -457,6 +473,11 @@ def assemble_report(
         verdicts: The JMQ verdicts, used only for the bias audit; may be None.
         thresholds: Optional threshold record for config (e.g. cost preflight).
         started / finished: ISO timestamps; defaulted to now when omitted.
+        corpus: The corpus tag of the scored sets (e.g. ``"fineweb"`` /
+            ``"personal"``), recorded in ``compared["corpus"]`` when given so a
+            downstream comparison can honor FR-010 (exclude the benchmark from a
+            personal-corpus run). Omitted (``None``) leaves the key absent, which
+            existing callers do; the comparison falls back to the set-id naming.
     """
     ran_mmd = mmd_result is not None
     ran_token_l2 = token_l2_result is not None
@@ -475,13 +496,17 @@ def assemble_report(
     if ran_jmq and verdicts is not None:
         jmq_block["bias_audit"] = order_distribution(verdicts)
 
+    compared: dict[str, Any] = {
+        "candidate_set": candidate_set,
+        "reference_set": reference_set,
+        "n": n,
+    }
+    if corpus is not None:
+        compared["corpus"] = corpus
+
     return MetricReport(
         report_id=report_id,
-        compared={
-            "candidate_set": candidate_set,
-            "reference_set": reference_set,
-            "n": n,
-        },
+        compared=compared,
         config=config,
         # NaN, not 0.0, for an un-run metric: a real zero (identical sets) must
         # never be confused with "did not run".
@@ -555,6 +580,7 @@ def score(
     embedder_id: str = "nvidia/llama-embed-nemotron-8b",
     thresholds: dict[str, Any] | None = None,
     min_n: int = DEFAULT_MIN_N,
+    corpus: str | None = None,
 ) -> MetricReport:
     """Score a candidate set vs a reference set into one MetricReport (FR-001).
 
@@ -584,6 +610,10 @@ def score(
             the JMQ A/B order.
         thresholds: Optional threshold record for config.
         min_n: Hard minimum-N gate passed to validation.
+        corpus: Explicit corpus tag override for ``compared["corpus"]``; when
+            ``None`` (the default) the corpus is taken from ``inputs.corpus``
+            (the candidate TextSet's tag, wired by :func:`load_scoring_inputs`),
+            so a real score run carries its corpus for the FR-010 gate.
 
     Raises:
         InputSetValidationError: on any failed input gate (before spend).
@@ -672,6 +702,7 @@ def score(
         verdicts=verdicts,
         thresholds=thresholds,
         started=started,
+        corpus=corpus if corpus is not None else inputs.corpus,
     )
 
 
@@ -806,5 +837,450 @@ def render_markdown(report: MetricReport) -> str:
             else:
                 lines.append(f"- {caveat}")
     lines.append("")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# Comparison assembly (FR-007, FR-010, Story 3) -- ADDITIVE.
+#
+# Everything below composes ALREADY-SCORED MetricReports (draft vs one-or-more
+# rewrites) into one comparison artifact: per-metric deltas, a k-round
+# trajectory when several rewrite reports are given, and (opt-in) the pinned
+# published benchmark rows. It never re-scores and never touches a model or the
+# network; it reads MetricReport dataclasses via the existing schemas. The score
+# path above (score / assemble_report / recompute_jmq / render_markdown) is
+# untouched.
+# =============================================================================
+
+# The corpus tag that must never be placed beside the published benchmark rows
+# (FR-010): the benchmark was measured on a public FineWeb subset, so attaching
+# it to a run scored on James's private posts would invite a false comparison
+# across incomparable corpora.
+PERSONAL_CORPUS = "personal"
+
+# The three metrics compared, each with its "closer to human is..." direction.
+# MMD and token-L2 measure distance from the human distribution (lower = closer
+# to human); JMQ is 2*win-rate vs human (higher = closer to parity with human).
+# "improved" in a delta means "moved closer to human", disambiguating the raw
+# sign so a reader never has to remember which way each metric points.
+COMPARISON_METRICS: tuple[tuple[str, str], ...] = (
+    ("mmd", "lower_is_better"),
+    ("token_l2", "lower_is_better"),
+    ("jmq", "higher_is_better"),
+)
+
+
+class PersonalCorpusBenchmarkError(ValueError):
+    """Raised when ``--benchmark`` is asked for over a personal-corpus report.
+
+    A hard, loud refusal (mapped to exit 2 by the CLI), per FR-010: the pinned
+    benchmark rows come from a public corpus, so they must never be attached to
+    a comparison whose inputs were scored on the personal corpus. The alternative
+    -- silently dropping the benchmark rows, or silently scoring the personal set
+    into a benchmark comparison -- is exactly the false-comparison failure FR-010
+    exists to prevent, so this refuses rather than degrades.
+    """
+
+
+def report_corpus(report: MetricReport) -> str | None:
+    """Best-effort corpus tag for a MetricReport, for the FR-010 gate.
+
+    Primary source: ``compared["corpus"]`` when the scoring run recorded it.
+    Fallback (defense-in-depth): the set-id naming convention -- a personal
+    corpus is built with ``set_id`` prefixed ``personal-`` (see
+    :func:`dehip.corpus.build_personal_corpus`), so a report whose candidate or
+    reference set id starts with ``personal-`` is treated as personal even if the
+    explicit corpus tag was never stamped. Returning :data:`PERSONAL_CORPUS` for
+    either signal means the benchmark refusal cannot be dodged by an
+    older report that predates the explicit tag.
+    """
+    compared = report.compared or {}
+    corpus = compared.get("corpus")
+    if isinstance(corpus, str) and corpus:
+        return corpus
+    for key in ("candidate_set", "reference_set"):
+        value = compared.get(key)
+        if isinstance(value, str) and value.startswith(f"{PERSONAL_CORPUS}-"):
+            return PERSONAL_CORPUS
+    return None
+
+
+def _is_personal(report: MetricReport) -> bool:
+    return report_corpus(report) == PERSONAL_CORPUS
+
+
+def _jmq_overall_score(report: MetricReport) -> float | None:
+    """The single JMQ number a comparison uses: ``jmq.overall.score``.
+
+    ``None`` when JMQ did not run (empty jmq block) or when the overall
+    dimension had no valid verdicts (aggregation yields ``score=None``). Kept
+    distinct from a real ``0.0`` so a null is never folded into a 0 delta.
+    """
+    jmq = report.jmq or {}
+    overall = jmq.get("overall")
+    if isinstance(overall, dict):
+        score = overall.get("score")
+        if isinstance(score, (int, float)) and not _is_nan(score):
+            return float(score)
+    return None
+
+
+def _is_nan(value: Any) -> bool:
+    """True only for a float NaN (an un-run mmd/token_l2 sentinel)."""
+    return isinstance(value, float) and value != value
+
+
+def _metric_value(report: MetricReport, metric: str) -> float | None:
+    """Pull one comparison metric from a report, or ``None`` if un-run/absent.
+
+    ``mmd``/``token_l2`` carry ``NaN`` when un-run (mapped to ``None`` here so a
+    downstream delta is marked not-comparable, never a 0). ``jmq`` resolves to
+    the overall score.
+    """
+    if metric == "jmq":
+        return _jmq_overall_score(report)
+    value = getattr(report, metric)
+    if value is None or _is_nan(value):
+        return None
+    return float(value)
+
+
+def metric_delta(
+    metric: str,
+    direction: str,
+    draft_value: float | None,
+    rewrite_value: float | None,
+) -> dict[str, Any]:
+    """Per-metric delta = rewrite - draft, with an unambiguous direction read.
+
+    The raw ``delta`` is ``rewrite - draft`` (signed). ``status`` interprets that
+    against the metric's direction as a TRI-STATE so a metric that did not move is
+    never misreported as a regression:
+
+    - ``"improved"`` -- moved closer to human (a negative delta for a
+      lower-is-better metric, a positive delta for a higher-is-better one).
+    - ``"regressed"`` -- moved farther from human.
+    - ``"unchanged"`` -- an EXACTLY zero delta: neither closer nor farther.
+
+    ``improved`` keeps its original boolean meaning for a NON-zero delta (``True``
+    when the status is ``"improved"``, ``False`` when ``"regressed"``) so existing
+    callers reading the boolean stay valid; for an unchanged (zero-delta) metric
+    ``improved`` is ``None`` (a no-change is not a regression), and the ``status``
+    field is the reliable read. Render via :func:`_fmt_delta`.
+
+    Null handling (CRITICAL): if EITHER value is ``None`` (metric un-run in one
+    of the two reports), the delta is ``None``, ``comparable`` is ``False``,
+    ``status`` is ``None`` and ``improved`` is ``None`` -- a null NEVER becomes a
+    silent 0 delta.
+    """
+    if draft_value is None or rewrite_value is None:
+        return {
+            "metric": metric,
+            "direction": direction,
+            "draft": draft_value,
+            "rewrite": rewrite_value,
+            "delta": None,
+            "improved": None,
+            "status": None,
+            "comparable": False,
+        }
+    delta = rewrite_value - draft_value
+    if direction == "lower_is_better":
+        moved_closer = delta < 0
+    elif direction == "higher_is_better":
+        moved_closer = delta > 0
+    else:  # pragma: no cover - COMPARISON_METRICS only uses the two above
+        raise ValueError(f"unknown metric direction {direction!r}")
+    # Tri-state: an exactly-zero delta is "unchanged", never a regression. Only a
+    # genuinely non-zero delta gets the improved/regressed boolean.
+    if delta == 0:
+        status = "unchanged"
+        improved: bool | None = None
+    elif moved_closer:
+        status = "improved"
+        improved = True
+    else:
+        status = "regressed"
+        improved = False
+    return {
+        "metric": metric,
+        "direction": direction,
+        "draft": draft_value,
+        "rewrite": rewrite_value,
+        "delta": delta,
+        "improved": improved,
+        "status": status,
+        "comparable": True,
+    }
+
+
+def _report_round(report: MetricReport) -> int | None:
+    """The k-round a rewrite report scored, if recorded.
+
+    Prefers an explicit ``compared["round"]`` (always emitted by the rewrite
+    stage, so it is the reliable primary); falls back only to ``config["round"]``.
+    A ``config["k"]`` fallback is deliberately NOT consulted: ``k`` is overloaded
+    (the rewrite state machine uses ``k`` as the current-round index), so reading
+    it here could silently misorder the trajectory. ``None`` when no round is
+    recorded (a single rewrite with no trajectory needs none).
+    """
+    for source, key in (
+        (report.compared, "round"),
+        (report.config, "round"),
+    ):
+        if isinstance(source, dict):
+            value = source.get(key)
+            if isinstance(value, int):
+                return value
+    return None
+
+
+def _deltas_for(
+    draft: MetricReport, rewrite: MetricReport
+) -> dict[str, dict[str, Any]]:
+    """All per-metric deltas between one draft and one rewrite report."""
+    return {
+        metric: metric_delta(
+            metric,
+            direction,
+            _metric_value(draft, metric),
+            _metric_value(rewrite, metric),
+        )
+        for metric, direction in COMPARISON_METRICS
+    }
+
+
+def _trajectory_row(rewrite: MetricReport, index: int) -> dict[str, Any]:
+    """One k-trajectory row: the round (or its input index) plus each metric."""
+    round_no = _report_round(rewrite)
+    return {
+        "round": round_no,
+        "input_index": index,
+        "report_id": rewrite.report_id,
+        "mmd": _metric_value(rewrite, "mmd"),
+        "token_l2": _metric_value(rewrite, "token_l2"),
+        "jmq": _metric_value(rewrite, "jmq"),
+    }
+
+
+def assemble_comparison(
+    *,
+    draft: MetricReport,
+    rewrites: Sequence[MetricReport],
+    comparison_id: str,
+    attach_benchmark: bool = False,
+) -> dict[str, Any]:
+    """Assemble the comparison artifact (FR-007, FR-010) from scored reports.
+
+    Places the draft scores, each rewrite's scores, and per-metric deltas side by
+    side. When more than one rewrite report is given, adds a k-trajectory table
+    ORDERED BY ROUND (ascending) even when the inputs arrive in mixed round order
+    -- a rewrite with no recorded round sorts after all rounded rewrites, by its
+    input index, so a mixed batch is never scrambled. When ``attach_benchmark``
+    is set, the pinned published rows are attached WITH their external-protocol
+    caveat.
+
+    FR-010 refusal (HARD): if ``attach_benchmark`` is set, this raises
+    :class:`PersonalCorpusBenchmarkError` when ANY input report (draft or any
+    rewrite) is on the personal corpus, AND ALSO when any input's corpus cannot be
+    CONFIRMED non-personal -- i.e. its corpus tag is absent and its set-id carries
+    no positive signal (:func:`report_corpus` returns ``None``). Under a benchmark
+    run the safe default is refuse-on-uncertainty: a report of unknown provenance
+    might be personal, and placing an unverified corpus beside the public
+    benchmark rows is exactly the false comparison FR-010 exists to prevent. It
+    never silently drops the benchmark rows and never silently scores an
+    unconfirmed set into a benchmark comparison. Without ``attach_benchmark``, a
+    personal-corpus OR unknown-corpus comparison assembles normally (deltas +
+    trajectory, no benchmark rows).
+
+    Returns a plain, strict-JSON-safe dict (no ``NaN``: un-run metrics are already
+    ``None`` here). Rendering is :func:`render_comparison`.
+    """
+    if not rewrites:
+        raise ValueError("assemble_comparison requires at least one rewrite report")
+
+    all_reports = [draft, *rewrites]
+
+    if attach_benchmark:
+        personal = [r for r in all_reports if _is_personal(r)]
+        if personal:
+            ids = ", ".join(sorted(r.report_id for r in personal))
+            raise PersonalCorpusBenchmarkError(
+                "refusing --benchmark: the published benchmark rows are measured "
+                "on a public corpus, but these input report(s) were scored on the "
+                f"personal corpus and must not be placed beside them (FR-010): {ids}. "
+                "Re-run without --benchmark to assemble the non-benchmark comparison."
+            )
+        # Refuse-on-uncertainty: an input whose corpus cannot be CONFIRMED
+        # non-personal (no explicit tag and no positive set-id signal) might be
+        # personal, so it must not be attached to the public benchmark either.
+        unconfirmed = [r for r in all_reports if report_corpus(r) is None]
+        if unconfirmed:
+            ids = ", ".join(sorted(r.report_id for r in unconfirmed))
+            raise PersonalCorpusBenchmarkError(
+                "refusing --benchmark: the published benchmark rows are measured "
+                "on a public corpus, but these input report(s) carry no corpus tag "
+                "and cannot be confirmed non-personal, so they must not be placed "
+                f"beside the benchmark (FR-010): {ids}. Re-run without --benchmark, "
+                "or re-score so the report records its corpus."
+            )
+
+    draft_scores = {
+        "report_id": draft.report_id,
+        "corpus": report_corpus(draft),
+        "mmd": _metric_value(draft, "mmd"),
+        "token_l2": _metric_value(draft, "token_l2"),
+        "jmq": _metric_value(draft, "jmq"),
+    }
+
+    rewrite_blocks: list[dict[str, Any]] = []
+    for rewrite in rewrites:
+        rewrite_blocks.append(
+            {
+                "report_id": rewrite.report_id,
+                "corpus": report_corpus(rewrite),
+                "round": _report_round(rewrite),
+                "mmd": _metric_value(rewrite, "mmd"),
+                "token_l2": _metric_value(rewrite, "token_l2"),
+                "jmq": _metric_value(rewrite, "jmq"),
+                "deltas": _deltas_for(draft, rewrite),
+            }
+        )
+
+    comparison: dict[str, Any] = {
+        "comparison_id": comparison_id,
+        "metric_directions": {m: d for m, d in COMPARISON_METRICS},
+        "draft": draft_scores,
+        "rewrites": rewrite_blocks,
+    }
+
+    # k-trajectory only when several rewrite reports are scored. Ordered by
+    # (round, input_index): rounded rewrites ascend by round; an unrounded
+    # rewrite sorts last by its arrival index, so a mixed-order batch (k3, k1,
+    # k2) renders k1, k2, k3.
+    if len(rewrites) > 1:
+        rows = [_trajectory_row(rw, i) for i, rw in enumerate(rewrites)]
+        rows.sort(
+            key=lambda row: (
+                row["round"] is None,
+                row["round"] if row["round"] is not None else 0,
+                row["input_index"],
+            )
+        )
+        comparison["trajectory"] = rows
+
+    if attach_benchmark:
+        from dehip.benchmark import benchmark_table_to_jsonable
+
+        comparison["benchmark"] = benchmark_table_to_jsonable()
+
+    return comparison
+
+
+# --- Comparison rendering ----------------------------------------------------
+
+
+def _fmt_opt(value: float | None) -> str:
+    """Render an optional metric number; ``None`` (un-run) shows as a marker."""
+    if value is None:
+        return "not run"
+    return f"{value:.6g}"
+
+
+def _fmt_delta(cell: dict[str, Any]) -> str:
+    """Render one delta cell: signed delta + a closer/farther/no-change note.
+
+    Tri-state on ``status`` so an exactly-zero delta reads as "no change" rather
+    than being folded into "farther from human": ``improved`` -> "closer to
+    human", ``regressed`` -> "farther from human", ``unchanged`` -> "no change".
+    """
+    if not cell.get("comparable"):
+        return "n/a (metric un-run in one report)"
+    delta = cell["delta"]
+    status = cell.get("status")
+    if status == "unchanged":
+        note = "no change"
+    elif status == "improved":
+        note = "closer to human"
+    else:  # "regressed"
+        note = "farther from human"
+    sign = "+" if delta >= 0 else ""
+    return f"{sign}{delta:.6g} ({note})"
+
+
+def render_comparison(comparison: dict[str, Any]) -> str:
+    """Render a comparison dict as readable markdown (JSON's companion).
+
+    Sections: header, a side-by-side draft/rewrite/delta table per rewrite, the
+    k-trajectory table (when present), and the benchmark rows (when attached)
+    ALWAYS preceded by the external-protocol caveat. Deterministic given the
+    comparison dict.
+    """
+    lines: list[str] = []
+    lines.append(f"# Comparison {comparison.get('comparison_id')}")
+    lines.append("")
+
+    draft = comparison.get("draft", {})
+    lines.append(
+        f"Draft `{draft.get('report_id')}` (corpus `{draft.get('corpus')}`) vs "
+        f"{len(comparison.get('rewrites', []))} rewrite report(s)."
+    )
+    lines.append("")
+
+    # Per-rewrite side-by-side: draft, rewrite, delta for each metric.
+    for block in comparison.get("rewrites", []):
+        header = f"## Rewrite `{block.get('report_id')}`"
+        if block.get("round") is not None:
+            header += f" (round {block['round']})"
+        lines.append(header)
+        lines.append("")
+        lines.append("| Metric | Draft | Rewrite | Delta |")
+        lines.append("| --- | --- | --- | --- |")
+        deltas = block.get("deltas", {})
+        for metric, _direction in COMPARISON_METRICS:
+            cell = deltas.get(metric, {})
+            lines.append(
+                f"| {metric} | {_fmt_opt(cell.get('draft'))} | "
+                f"{_fmt_opt(cell.get('rewrite'))} | {_fmt_delta(cell)} |"
+            )
+        lines.append("")
+
+    trajectory = comparison.get("trajectory")
+    if trajectory:
+        lines.append("## k-round trajectory")
+        lines.append("")
+        lines.append("| Round | Report | MMD | token-L2 | JMQ overall |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for row in trajectory:
+            round_label = row.get("round")
+            round_str = "k?" if round_label is None else f"k{round_label}"
+            lines.append(
+                f"| {round_str} | {row.get('report_id')} | "
+                f"{_fmt_opt(row.get('mmd'))} | {_fmt_opt(row.get('token_l2'))} | "
+                f"{_fmt_opt(row.get('jmq'))} |"
+            )
+        lines.append("")
+
+    benchmark = comparison.get("benchmark")
+    if benchmark:
+        # The external-protocol caveat ALWAYS renders before the rows, so a
+        # benchmark table is never shown as a clean apples-to-apples comparison
+        # (FR-007). The caveat text comes from the attached payload, not a literal
+        # here, so JSON and markdown never drift.
+        lines.append("## Published benchmark (external protocol)")
+        lines.append("")
+        lines.append(f"> {benchmark.get('caveat')}")
+        lines.append("")
+        lines.append(f"Source: {benchmark.get('source')}.")
+        lines.append("")
+        lines.append("| Model | MMD (lower) | JMQ (higher) | token-L2 (lower) |")
+        lines.append("| --- | --- | --- | --- |")
+        for row in benchmark.get("rows", []):
+            lines.append(
+                f"| {row.get('model')} | {row.get('mmd')} | {row.get('jmq')} | "
+                f"{row.get('token_l2')} |"
+            )
+        lines.append("")
 
     return "\n".join(lines)
