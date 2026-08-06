@@ -36,14 +36,15 @@ ALL_COMMANDS = sorted(cli.COMMANDS)
 
 # Commands still served by the shared stub. ``build-corpus`` (issue #5),
 # ``score`` (issue #10), ``generate`` (issue #12), ``self-check`` (issue #11),
-# and ``rewrite`` (issue #13) became real commands, so their handlers no longer
-# emit the {"status": "stub"} summary and are excluded from the stub-shape
-# assertions below (their behavior is covered by test_corpus.py,
-# test_score_cli.py, test_generate.py, test_self_check.py, and
-# test_cascade.py). Flag-rejection (argparse, pre-handler) still covers every
-# command. The rest remain stubs until their own tickets.
+# ``rewrite`` (issue #13), and ``detect`` (issue #14) became real commands, so
+# their handlers no longer emit the {"status": "stub"} summary and are excluded
+# from the stub-shape assertions below (their behavior is covered by
+# test_corpus.py, test_score_cli.py, test_generate.py, test_self_check.py,
+# test_cascade.py, and test_detector.py). Flag-rejection (argparse, pre-handler)
+# still covers every command. ``report`` remains a stub until issue #15.
 STUB_COMMANDS = sorted(
-    set(cli.COMMANDS) - {"build-corpus", "score", "generate", "self-check", "rewrite"}
+    set(cli.COMMANDS)
+    - {"build-corpus", "score", "generate", "self-check", "rewrite", "detect"}
 )
 
 def _run_cli(argv):
@@ -107,9 +108,11 @@ def test_seed_appears_in_summary(command):
 
 
 def test_default_seed_recorded():
-    # build-corpus/rewrite are no longer stubs (issues #5/#13); use a remaining
-    # stub command.
-    summary = _run_json(["detect", "--sets", "a.json", "b.json"])
+    # Most commands are no longer stubs (issues #5/#10/#11/#12/#13/#14); use the
+    # remaining stub command (report, issue #15).
+    summary = _run_json(
+        ["report", "--draft-report", "draft.json", "--rewrite-report", "rw.json"]
+    )
     assert summary["seed"] == 0
 
 
