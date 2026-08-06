@@ -53,6 +53,8 @@ Code: https://github.com/YixuanEvenXu/humanization-by-iterative-paraphrasing (co
 
 ## Phase 0: zero-training pipeline
 
+Status: implemented as the `dehip` cascade (`generate` -> `rewrite`), unit- and integration-tested with injected model and hip-run seams. Real-instrument validation on released adapters (the actual smoke run) is pending, tracked in issue #16.
+
 Goal: a working instruct -> HIP cascade with released adapters. No training.
 
 1. Clone the HIP repo (`just clone-hip`).
@@ -63,6 +65,8 @@ Goal: a working instruct -> HIP cascade with released adapters. No training.
 Local constraint: on a 36GB Mac the 0.6B and 4B merged models are fine under llama.cpp or MLX. Anything bigger, or any training, means a rented GPU.
 
 ## Phase 1: the Rosmine eval harness
+
+Status: implemented as `dehip score` (with `self-check`, `detect`, and `report`), unit- and integration-tested with injected embedder, judge, and detector seams. All three metrics, the self-check noise gate, the cost gates, and the comparison assembly are built. Numbers on real models and real judge/detector calls are pending (issue #16).
 
 This is the reusable asset regardless of how the cascade performs. Build in `harness/`:
 

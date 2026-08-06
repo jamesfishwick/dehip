@@ -3,9 +3,11 @@
 Subcommand dispatch (build-corpus, generate, rewrite, score, self-check,
 detect, report) per specs/001-hip-cascade-harness/contracts/cli.md.
 
-Most commands are now real; ``report`` remains a stub that parses its documented
-flags, echoes a JSON result summary to stdout, writes human-readable progress to
-stderr, and exits cleanly (its real behavior lands in issue #15). Exit-code
+Every subcommand is real; each reads and writes the file formats in
+data-model.md, gates spend before any judge/detector call, prints a JSON result
+summary to stdout with human-readable progress on stderr, and returns the exit
+code below. Real-instrument validation on live models, judges, and detectors is
+tracked separately (issue #16) and is not what these handlers assert. Exit-code
 contract (all commands):
 
     0  success

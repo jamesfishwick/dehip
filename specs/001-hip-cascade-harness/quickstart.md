@@ -17,7 +17,7 @@ git clone https://github.com/YixuanEvenXu/humanization-by-iterative-paraphrasing
 ## 2. Smoke corpus (50 pairs, ~$1 of prompt generation)
 
 ```bash
-uv run dehip build-corpus --tier smoke --corpus fineweb --seed 42
+uv run dehip --seed 42 build-corpus --tier smoke --corpus fineweb
 ```
 
 ## 3. Prove the harness before trusting it
@@ -31,7 +31,7 @@ Must pass (MMD ~0, token L2 ~0 on a half-vs-half split) before anything downstre
 ## 4. Generate drafts, rewrite through HIP
 
 ```bash
-uv run dehip generate --corpus data/corpus/fineweb-smoke.jsonl --seed 42
+uv run dehip --seed 42 generate --corpus data/corpus/fineweb-smoke.jsonl
 uv run dehip rewrite  --run results/runs/<run_id>/ --rounds 2
 ```
 
@@ -40,10 +40,12 @@ First rewrite run downloads the 4B base model + adapter (~8GB). Watch stderr for
 ## 5. Score and compare
 
 ```bash
-uv run dehip score --candidate results/runs/<run_id>/sets/draft.manifest.json \
-                   --reference data/corpus/fineweb-smoke.manifest.json --yes
-uv run dehip score --candidate results/runs/<run_id>/sets/rewrite-k2.manifest.json \
-                   --reference data/corpus/fineweb-smoke.manifest.json --yes
+uv run dehip score --candidate results/runs/<run_id>/draft.manifest.json \
+                   --reference data/corpus/fineweb-smoke.manifest.json \
+                   --prompts data/corpus/fineweb-smoke.jsonl --yes
+uv run dehip score --candidate results/runs/<run_id>/rewrite-k2.manifest.json \
+                   --reference data/corpus/fineweb-smoke.manifest.json \
+                   --prompts data/corpus/fineweb-smoke.jsonl --yes
 uv run dehip report --draft-report results/reports/<draft>.json \
                     --rewrite-report results/reports/<rewrite>.json --benchmark
 ```
