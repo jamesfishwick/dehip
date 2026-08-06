@@ -23,7 +23,8 @@ clone-hip:
     cd {{hip_dir}} && uv sync
 
 # The adapter id matches `dehip rewrite --adapter`; 4B is the harness default.
-# Example: `just fetch-adapter size=0.6B` or `just fetch-adapter size=4B`.
+# Pass the size positionally: `just fetch-adapter 0.6B` or `just fetch-adapter 4B`
+# (NOT `size=0.6B` -- just reads that as the literal argument value).
 # Fetch a released HIP LoRA adapter by size (0.6B, 1.7B, 4B, 8B, 14B).
 fetch-adapter size="4B":
     uv run hf download YixuanEvenXu/Qwen3-{{size}}-Base-HIP-adapter \

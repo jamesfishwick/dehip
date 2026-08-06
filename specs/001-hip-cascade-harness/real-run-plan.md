@@ -7,7 +7,7 @@ The only ticket that spends real compute and API money. Run the whole pipeline o
 - `OPENAI_API_KEY`: the judge (gpt-5.4-mini) and prompt reverse-generation in build-corpus.
 - `PANGRAM_API_KEY` (or `GPTZERO_API_KEY`): the external detector for SC-005.
 - HIP sibling checkout: `just clone-hip` clones YixuanEvenXu/humanization-by-iterative-paraphrasing next door and uv-syncs it.
-- HIP adapters: `just fetch-adapter size=0.6B` (smoke) and `size=4B` (the full run).
+- HIP adapters: `just fetch-adapter 0.6B` (smoke) and `just fetch-adapter 4B` (the full run). Pass the size positionally, not as `size=...`.
 - Hardware: a 36GB Apple Silicon Mac (MPS). The first run downloads roughly 30GB of weights: Qwen3-4B-Instruct-2507 (~8GB), llama-embed-nemotron-8b (~16GB), and the HIP base plus adapter.
 
 The keys never enter this repo or the transcript. Export them in the shell before the run.
@@ -26,7 +26,7 @@ Compute is local (electricity only). Wall-clock is roughly half a day.
 
 ## Sequence
 
-1. Setup: `uv sync`, `just clone-hip`, `just fetch-adapter size=0.6B` then `size=4B`.
+1. Setup: `uv sync`, `just clone-hip`, `just fetch-adapter 0.6B` then `just fetch-adapter 4B`.
 2. `dehip --seed 42 build-corpus --tier smoke --corpus fineweb` (50 pairs).
 3. Self-check first, the trust gate: `dehip self-check --skip-jmq`. MMD near zero, token-L2 near zero on a half-vs-half split. If this fails, stop. It is a harness bug, not a result.
 4. `dehip --seed 42 generate` (50 drafts).
