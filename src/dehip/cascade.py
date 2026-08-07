@@ -155,23 +155,25 @@ class HipRunner(Protocol):
     ) -> dict[str, str]:
         """Return the rewrite of every input text for round ``round_k``.
 
-        The returned mapping must cover exactly the input pair_ids. ``seed`` is the
-        harness-controlled seed passed through to ``hip-run`` for reproducibility.
-        Implementations raise :class:`HipRunError` on any failure so the caller
-        need not know how the round was produced.
+        The returned mapping must cover exactly the input pair_ids. ``seed`` is a
+        harness bookkeeping value only -- ``hip-run`` has no seed flag and never
+        seeds the RNG (inference.py), so it is NOT emitted into the config; the
+        sampling that actually governs the rewrite (``temperature``/``top_p``)
+        lives on the implementation. Implementations raise :class:`HipRunError`
+        on any failure so the caller need not know how the round was produced.
         """
         ...
 
-    def config_for(
-        self, *, round_k: int, adapter_id: str, seed: int
-    ) -> dict[str, Any]:
+    def config_for(self, *, round_k: int, adapter_id: str) -> dict[str, Any]:
         """Return the REQUESTED config for ``round_k``, inlined into the bundle audit.
 
         Recorded verbatim in each bundle's ``hip_config`` (data-model.md), so a
         review can see exactly what config was HANDED TO ``hip-run`` for every
-        round -- including the ``seed`` the harness controls. This is the
-        requested config, advisory for any field ``hip-run`` may override at run
-        time; it is not a readback of what ``hip-run`` actually applied.
+        round -- including the ``temperature``/``top_p`` that actually govern the
+        rewrite (inference.py:118-120). This is the requested config, advisory for
+        any field ``hip-run`` may override at run time; it is not a readback of
+        what ``hip-run`` actually applied. It carries only fields ``hip-run``
+        reads: no dead ``round`` key and no ``seed`` (``hip-run`` ignores both).
         """
         ...
 
@@ -192,12 +194,15 @@ class SubprocessHipRunner:
     (the HF adapter id, NOT ``adapter_id``), ``input_jsonl``, ``text_field``,
     ``output_parquet``, ``metadata_json``, ``num_rounds`` (1 per invocation so
     the cascade's inter-round degeneration checks run one round at a time), plus
-    sampling knobs. ``hip-run`` resolves relative config paths against the HIP
-    repo root, so ``input_jsonl``/``output_parquet``/``metadata_json`` are
+    the sampling knobs ``temperature``/``top_p`` that actually govern the rewrite
+    (inference.py:118-120). ``hip-run`` resolves relative config paths against the
+    HIP repo root, so ``input_jsonl``/``output_parquet``/``metadata_json`` are
     written as ABSOLUTE paths (``dehip``'s work dir is in the dehip repo, not the
     HIP repo). ``base_model`` is OMITTED by default so any adapter self-resolves
     to its correct base via its ``PeftConfig``; it is only emitted when the
-    caller passes a ``base_model`` override.
+    caller passes a ``base_model`` override. No ``round`` key (``hip-run`` never
+    reads it) and no ``seed`` (``hip-run`` has no seed flag) are emitted: the
+    config carries only fields ``hip-run`` actually applies.
 
     The precondition (:func:`check_hip_precondition`) must have passed before a
     real round runs; this class does not re-check it per round.
@@ -209,6 +214,8 @@ class SubprocessHipRunner:
         *,
         work_dir: str | Path,
         base_model: str | None = None,
+        temperature: float = 1.0,
+        top_p: float = 0.95,
         timeout_s: float = 7200.0,
     ) -> None:
         self.hip_repo = Path(hip_repo)
@@ -217,24 +224,30 @@ class SubprocessHipRunner:
         # PeftConfig (base_model_name_or_path). Only an explicit override is
         # emitted into the config so an adapter never resolves to a wrong base.
         self.base_model = base_model
+        # temperature/top_p are the sampling knobs hip-run actually applies
+        # (inference.py:118-120). Defaults match the HIP inference protocol
+        # (temperature 1.0, top_p 0.95); they are emitted into the config AND
+        # recorded in the bundle audit so the durable provenance shows the
+        # sampling that governed each rewrite.
+        self.temperature = temperature
+        self.top_p = top_p
         # CPU inference in float32 (hip-run's choose_dtype has no CUDA/MPS path
         # on this machine) is slow, so the per-round timeout is generous.
         self.timeout_s = timeout_s
 
-    def config_for(
-        self, *, round_k: int, adapter_id: str, seed: int
-    ) -> dict[str, Any]:
-        """Build the per-round hip-run AUDIT config (one round, one adapter, one seed).
+    def config_for(self, *, round_k: int, adapter_id: str) -> dict[str, Any]:
+        """Build the per-round hip-run AUDIT config (one round, one adapter).
 
         Recorded verbatim in each bundle's ``hip_config`` (data-model.md). It is
         the path-independent audit view of what ``hip-run`` was handed for
         ``round_k``: ``adapter_path`` (the real key ``hip-run`` reads, mapped from
         the harness ``adapter_id``), ``num_rounds`` 1, ``text_field`` ``"text"``,
-        and the harness-controlled ``seed``. ``base_model`` appears ONLY when an
-        override was passed to the constructor -- omitting it lets the adapter
-        self-resolve its base. The ``seed`` is recorded for the reproducibility
-        audit trail even though ``hip-run`` ignores it (its argparse has no seed
-        flag; it is advisory, like every field ``hip-run`` may override).
+        and the ``temperature``/``top_p`` that actually govern the rewrite
+        (inference.py:118-120). ``base_model`` appears ONLY when an override was
+        passed to the constructor -- omitting it lets the adapter self-resolve its
+        base. No dead ``round`` key (``hip-run`` never reads it) and no ``seed``
+        (``hip-run`` has no seed flag and never seeds the RNG) are emitted, so the
+        audit shows only the fields that controlled the output.
 
         The full run-time config emitted to disk in :meth:`run_round` extends
         this with the ABSOLUTE ``input_jsonl``/``output_parquet``/``metadata_json``
@@ -244,9 +257,9 @@ class SubprocessHipRunner:
         config: dict[str, Any] = {
             "adapter_path": adapter_id,
             "num_rounds": 1,
-            "round": round_k,
             "text_field": "text",
-            "seed": seed,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
         }
         if self.base_model is not None:
             config["base_model"] = self.base_model
@@ -305,9 +318,7 @@ class SubprocessHipRunner:
                 fh.write(json.dumps({"text": inputs[pair_id], "pair_id": pair_id}))
                 fh.write("\n")
 
-        config = self.config_for(
-            round_k=round_k, adapter_id=adapter_id, seed=seed
-        )
+        config = self.config_for(round_k=round_k, adapter_id=adapter_id)
         config["input_jsonl"] = str(input_path)
         config["output_parquet"] = str(output_path)
         config["metadata_json"] = str(metadata_path)
@@ -345,17 +356,25 @@ def _parse_round_output(
     ``hip-run`` writes a parquet (NOT a JSONL) with one row per input example per
     round. The columns this reads: ``source_row_index`` (the 0-based position of
     the row in the input JSONL -- the key back to the pair_id, since the caller
-    wrote the input in ``ordered_ids`` order), ``round`` (1-indexed; the cascade
-    runs ``num_rounds`` 1 so it reads the ``round == round_k`` rows), and
-    ``output_text`` (the rewrite). ``hip-run`` does NOT carry ``pair_id``, so the
-    mapping is purely positional: ``ordered_ids[source_row_index]``.
+    wrote the input in ``ordered_ids`` order) and ``output_text`` (the rewrite).
+    ``hip-run`` does NOT carry ``pair_id``, so the mapping is purely positional:
+    ``ordered_ids[source_row_index]``.
+
+    The cascade invokes ``hip-run`` once per cascade round with ``num_rounds`` 1,
+    and ``hip-run``'s round loop is ``range(1, num_rounds + 1)`` (inference.py:124,
+    161), so EVERY output row is stamped ``round == 1`` regardless of which cascade
+    round produced it. This parquet therefore holds exactly ONE round; there is no
+    per-round filtering to do here, and filtering on ``round == round_k`` would
+    silently drop every row for any cascade round beyond the first (the exact bug
+    that killed the default 2-round run). All rows are kept.
 
     Raises :class:`HipRunError` if the parquet is missing/unreadable, lacks the
-    expected columns, a ``source_row_index`` is out of range, a pair the round
-    was asked to rewrite is absent from this round's rows, or any rewrite is
-    empty/whitespace-only. A blank or absent rewrite is treated exactly like
-    ``generate.py``'s empty-draft guard: loud failure, never a silently-persisted
-    blank.
+    expected columns, a ``source_row_index`` is out of range, a
+    ``source_row_index`` repeats (which would silently clobber one pair's rewrite
+    with another's), a pair the round was asked to rewrite is absent, or any
+    rewrite is empty/whitespace-only. A blank or absent rewrite is treated exactly
+    like ``generate.py``'s empty-draft guard: loud failure, never a
+    silently-persisted blank.
     """
     import pyarrow.parquet as pq  # local import: only the real path reads parquet
 
@@ -372,7 +391,10 @@ def _parse_round_output(
         ) from exc
 
     columns = set(table.column_names)
-    required = {"source_row_index", "round", "output_text"}
+    # ``round`` is intentionally NOT required: each single-round invocation writes
+    # exactly one round (always stamped 1), so we never filter on it and never
+    # need it present.
+    required = {"source_row_index", "output_text"}
     missing_cols = required - columns
     if missing_cols:
         raise HipRunError(
@@ -382,8 +404,6 @@ def _parse_round_output(
 
     result: dict[str, str] = {}
     for record in table.to_pylist():
-        if record["round"] != round_k:
-            continue  # hip-run emits one row per source row per round; take ours
         source_index = record["source_row_index"]
         if not isinstance(source_index, int) or not (
             0 <= source_index < len(ordered_ids)
@@ -393,6 +413,15 @@ def _parse_round_output(
                 f"source_row_index {source_index!r} (input had {len(ordered_ids)} rows)"
             )
         pair_id = ordered_ids[source_index]
+        # A repeated source_row_index would clobber one pair's rewrite with
+        # another's (wrong-pair attribution) and slip past the coverage/blank
+        # checks in _validate_round_result. Fail loudly instead of last-write-wins.
+        if pair_id in result:
+            raise HipRunError(
+                f"hip-run round {round_k} output parquet has a duplicate "
+                f"source_row_index {source_index} (pair {pair_id!r}); refusing to "
+                "clobber one pair's rewrite with another's"
+            )
         result[pair_id] = record["output_text"]
 
     return _validate_round_result(
@@ -509,10 +538,13 @@ def _run_rounds_for_pair(
 
     Every intermediate round -- good or degenerate -- is kept in
     ``bundle.rounds``. The bundle's ``hip_config`` inlines the REQUESTED config
-    handed to ``hip-run`` for each round (including the harness-controlled
-    ``seed``), advisory for any field ``hip-run`` may override -- not a readback
-    of what it applied. ``degeneration`` records the last round's report so
-    ``hard_tripped`` flags the bundle.
+    handed to ``hip-run`` for each round -- including the ``temperature``/``top_p``
+    that actually govern the rewrite -- advisory for any field ``hip-run`` may
+    override, not a readback of what it applied. The harness ``seed`` is recorded
+    top-level but marked ``seed_applied: False``: ``hip-run`` has no seed flag and
+    never seeds the RNG, so the seed is bookkeeping, not a reproducibility
+    guarantee. ``degeneration`` records the last round's report so ``hard_tripped``
+    flags the bundle.
     """
     assert bundle.draft is not None, "cascade requires a draft to rewrite from"
     draft_text = bundle.draft["text"]
@@ -528,7 +560,7 @@ def _run_rounds_for_pair(
     last_report = DegenerationReport()  # a clean (no-op) report if k == 0
 
     for k in range(1, requested_k + 1):
-        config = runner.config_for(round_k=k, adapter_id=adapter_id, seed=seed)
+        config = runner.config_for(round_k=k, adapter_id=adapter_id)
         hip_configs.append(config)
         result = runner.run_round(
             {bundle.pair_id: prior_good_text},
@@ -578,11 +610,17 @@ def _run_rounds_for_pair(
         degeneration=_degeneration_to_dict(last_report),
         adapter_id=adapter_id,
         # hip_config is the REQUESTED config passed to hip-run (advisory for
-        # fields hip-run may override), not a readback of what it applied. The
-        # harness-controlled seed is recorded at the top level so the audit trail
-        # is non-empty on the reproducibility field that matters even for a bundle
-        # with zero rounds, and mirrored per-round in ``rounds`` (IMPORTANT 2).
-        hip_config={"seed": seed, "rounds": hip_configs},
+        # fields hip-run may override), not a readback of what it applied. Each
+        # round's config carries the temperature/top_p that actually governed the
+        # rewrite. The harness seed is recorded top-level but marked
+        # ``seed_applied: False``: hip-run has no seed flag and never seeds the
+        # RNG, so it is bookkeeping, not a reproducibility guarantee -- honest
+        # provenance keeps the applied fields present and the inert one labeled.
+        hip_config={
+            "seed": seed,
+            "seed_applied": False,
+            "rounds": hip_configs,
+        },
         requested_k=requested_k,
         draft=bundle.draft,
     )

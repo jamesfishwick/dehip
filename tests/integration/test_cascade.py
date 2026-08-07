@@ -95,12 +95,14 @@ class ScriptedHipRunner:
             lambda text, k, pair_id: f"{text} [r{k}]"
         )
 
-    def config_for(self, *, round_k, adapter_id, seed=0):
+    def config_for(self, *, round_k, adapter_id):
+        # Mirrors the real seam's audit shape: only fields hip-run applies
+        # (adapter, num_rounds, sampling), no dead ``round`` key and no ``seed``.
         return {
-            "round": round_k,
-            "adapter_id": adapter_id,
-            "rounds": 1,
-            "seed": seed,
+            "adapter_path": adapter_id,
+            "num_rounds": 1,
+            "temperature": 1.0,
+            "top_p": 0.95,
         }
 
     def run_round(self, inputs, *, round_k, adapter_id, seed=0):
@@ -114,8 +116,8 @@ class ScriptedHipRunner:
 class BadOutputHipRunner:
     """Stub whose round omits a pair (a malformed/incomplete hip-run result)."""
 
-    def config_for(self, *, round_k, adapter_id, seed=0):
-        return {"round": round_k}
+    def config_for(self, *, round_k, adapter_id):
+        return {"adapter_path": adapter_id, "num_rounds": 1}
 
     def run_round(self, inputs, *, round_k, adapter_id, seed=0):
         return {}  # rewrote nothing: the pair is missing from the output
@@ -509,8 +511,8 @@ def test_empty_rewrite_via_cli_maps_to_exit_3(tmp_path, monkeypatch):
     monkeypatch.setattr(cascade_mod, "check_hip_precondition", lambda repo: None)
 
     class EmptyRewriteRunner:
-        def config_for(self, *, round_k, adapter_id, seed=0):
-            return {"round": round_k}
+        def config_for(self, *, round_k, adapter_id):
+            return {"adapter_path": adapter_id, "num_rounds": 1}
 
         def run_round(self, inputs, *, round_k, adapter_id, seed=0):
             return {pid: "   " for pid in inputs}  # whitespace-only rewrite
@@ -629,14 +631,14 @@ def test_per_round_manifest_emitted_per_round(tmp_path):
 
 
 def test_hip_config_records_requested_seed(tmp_path):
-    """hip_config carries the sampling/seed the harness requested for the audit.
+    """hip_config records the seed as advisory (not-applied) and the applied sampling.
 
-    The seed is the field the harness actually controls (the rewrite CLI has no
-    temperature/top_p flag; hip-run owns those). It must appear both at the top
-    level of ``hip_config`` and mirrored per round, so a resumed/reproduced run
-    has a non-empty reproducibility trail -- not the empty ``hip_config`` the
-    prior build emitted on the seed field. This is the REQUESTED config, advisory
-    for fields hip-run may override, not a readback of what it applied.
+    ``hip-run`` has no seed flag and never seeds the RNG (inference.py), so the
+    seed is bookkeeping, not a reproducibility guarantee: it is recorded top-level
+    but flagged ``seed_applied: False`` so it is never mistaken for one. The
+    fields that ACTUALLY govern the rewrite -- ``temperature``/``top_p`` -- are the
+    ones inlined per round, so a resumed/reproduced run has an honest trail of the
+    sampling that produced each round. No round carries a bare ``seed``.
     """
     bundles = _bundles(1)
     run_cascade(
@@ -652,8 +654,13 @@ def test_hip_config_records_requested_seed(tmp_path):
 
     bundle = read_jsonl(tmp_path / "rewrite-bundles.jsonl", RewriteBundle)[0]
     assert bundle.hip_config["seed"] == 4242
-    # Every round's requested config carries the same seed.
-    assert [rc["seed"] for rc in bundle.hip_config["rounds"]] == [4242, 4242]
+    # The seed is recorded but explicitly marked not-applied (advisory only).
+    assert bundle.hip_config["seed_applied"] is False
+    # Every round's requested config carries the applied sampling, not a seed.
+    assert [rc["temperature"] for rc in bundle.hip_config["rounds"]] == [1.0, 1.0]
+    assert [rc["top_p"] for rc in bundle.hip_config["rounds"]] == [0.95, 0.95]
+    assert all("seed" not in rc for rc in bundle.hip_config["rounds"])
+    assert all("round" not in rc for rc in bundle.hip_config["rounds"])
 
 
 def test_cli_threads_global_seed_into_hip_config(tmp_path, monkeypatch):
@@ -1112,7 +1119,9 @@ def _install_fake_hip_run(
         for source_index, row in enumerate(rows):
             if source_index in drop_indices:
                 continue
-            original = str(row.get(text_field) or "")
+            # The real hip-run strips input text (inference.py:112); mirror it so
+            # the fake's schema-fidelity claim stays honest.
+            original = str(row.get(text_field) or "").strip()
             out = rewrite(original, source_index)
             records.append(
                 {
@@ -1140,19 +1149,35 @@ def test_subprocess_config_emits_real_hip_run_schema(tmp_path, monkeypatch):
 
     Locks the config schema against hip/inference.py: adapter_path (NOT
     adapter_id), num_rounds 1 (one round per invocation for inter-round
-    degeneration), text_field "text", the harness seed, and -- written by
-    run_round -- input_jsonl / output_parquet / metadata_json / trust_remote_code.
+    degeneration), text_field "text", the applied sampling temperature/top_p
+    (inference.py:118-120), and -- written by run_round -- input_jsonl /
+    output_parquet / metadata_json / trust_remote_code. The dead ``round`` key and
+    the never-applied ``seed`` are NOT emitted. The exclusivity assertions run on
+    the on-disk cfg, not just the audit dict, so a stray ``adapter_id``/``round``/
+    ``seed`` written to disk would fail here.
     """
     calls = _install_fake_hip_run(monkeypatch)
     runner = cascade_mod.SubprocessHipRunner(tmp_path, work_dir=tmp_path / "work")
 
     # config_for is the path-independent audit view recorded in hip_config.
-    audit = runner.config_for(round_k=1, adapter_id="an-adapter-id", seed=7)
+    audit = runner.config_for(round_k=1, adapter_id="an-adapter-id")
     assert audit["adapter_path"] == "an-adapter-id"
     assert "adapter_id" not in audit  # the real key is adapter_path
     assert audit["num_rounds"] == 1
     assert audit["text_field"] == "text"
-    assert audit["seed"] == 7
+    assert audit["temperature"] == 1.0
+    assert audit["top_p"] == 0.95
+    assert "round" not in audit  # hip-run never reads a bare round key
+    assert "seed" not in audit  # hip-run has no seed flag
+    # The audit dict is exactly the fields hip-run reads (path keys are added
+    # only to the on-disk cfg in run_round).
+    assert set(audit) == {
+        "adapter_path",
+        "num_rounds",
+        "text_field",
+        "temperature",
+        "top_p",
+    }
 
     runner.run_round(
         {"fineweb-00000": "a draft with words"},
@@ -1163,9 +1188,28 @@ def test_subprocess_config_emits_real_hip_run_schema(tmp_path, monkeypatch):
     assert cfg["adapter_path"] == "an-adapter-id"
     assert cfg["num_rounds"] == 1
     assert cfg["text_field"] == "text"
+    assert cfg["temperature"] == 1.0
+    assert cfg["top_p"] == 0.95
     assert cfg["trust_remote_code"] is True
     for key in ("input_jsonl", "output_parquet", "metadata_json"):
         assert key in cfg
+    # Exclusivity on the EMITTED on-disk cfg (not just the audit dict): the stray
+    # adapter_id / round / seed keys must be absent from what hip-run actually
+    # reads, and the on-disk keyset is exactly the audit fields plus path/flag keys.
+    assert "adapter_id" not in cfg
+    assert "round" not in cfg
+    assert "seed" not in cfg
+    assert set(cfg) == {
+        "adapter_path",
+        "num_rounds",
+        "text_field",
+        "temperature",
+        "top_p",
+        "input_jsonl",
+        "output_parquet",
+        "metadata_json",
+        "trust_remote_code",
+    }
 
 
 def test_subprocess_invokes_config_only(tmp_path, monkeypatch):
@@ -1253,7 +1297,7 @@ def test_subprocess_config_omits_base_model_by_default(tmp_path, monkeypatch):
     """
     calls = _install_fake_hip_run(monkeypatch)
     runner = cascade_mod.SubprocessHipRunner(tmp_path, work_dir=tmp_path / "work")
-    audit = runner.config_for(round_k=1, adapter_id="ADP", seed=0)
+    audit = runner.config_for(round_k=1, adapter_id="ADP")
     assert "base_model" not in audit
 
     runner.run_round({"fineweb-00000": "a draft"}, round_k=1, adapter_id="ADP")
@@ -1266,7 +1310,7 @@ def test_subprocess_config_includes_base_model_when_overridden(tmp_path, monkeyp
     runner = cascade_mod.SubprocessHipRunner(
         tmp_path, work_dir=tmp_path / "work", base_model="Qwen/Qwen3-4B-Base"
     )
-    audit = runner.config_for(round_k=1, adapter_id="ADP", seed=0)
+    audit = runner.config_for(round_k=1, adapter_id="ADP")
     assert audit["base_model"] == "Qwen/Qwen3-4B-Base"
 
     runner.run_round({"fineweb-00000": "a draft"}, round_k=1, adapter_id="ADP")
@@ -1319,6 +1363,106 @@ def test_subprocess_missing_parquet_fails_loudly(tmp_path, monkeypatch):
     runner = cascade_mod.SubprocessHipRunner(tmp_path, work_dir=tmp_path / "work")
     with pytest.raises(HipRunError):
         runner.run_round({"fineweb-00000": "alpha"}, round_k=1, adapter_id="ADP")
+
+
+def _install_fake_hip_run_with_records(monkeypatch, *, records):
+    """Monkeypatch subprocess.run to write EXACTLY ``records`` to the parquet.
+
+    Unlike :func:`_install_fake_hip_run`, this lets a test control the raw rows --
+    including arbitrary ``round`` stamps and repeated ``source_row_index`` values --
+    so the round-filter and duplicate-index behavior can be exercised directly.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    def fake_run(cmd, **kwargs):
+        cfg = _yaml.safe_load(Path(cmd[4]).read_text(encoding="utf-8"))
+
+        class _Proc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        out_path = Path(cfg["output_parquet"])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.Table.from_pylist(records), out_path)
+        return _Proc()
+
+    monkeypatch.setattr(cascade_mod.subprocess, "run", fake_run)
+
+
+def test_subprocess_reads_the_single_round_the_parquet_holds(tmp_path, monkeypatch):
+    """A round_k=2 invocation resolves the pair even though hip-run stamps round 1.
+
+    The cascade runs hip-run once per round with num_rounds=1, and hip-run's loop
+    is range(1, num_rounds+1) (inference.py:124,161), so EVERY output row is
+    stamped round==1 no matter which cascade round produced it. The runner must
+    read the round the file actually contains, never filter on the cascade's
+    round_k. This parquet carries a round-1 AND a round-2 row for the one source
+    (distinguishable text); at round_k=2 the runner must still resolve the pair --
+    a round_k filter would drop every row and raise instead.
+    """
+    records = [
+        {"source_row_index": 0, "round": 1, "output_text": "the round-one rewrite"},
+        {"source_row_index": 0, "round": 2, "output_text": "the round-two rewrite"},
+    ]
+    _install_fake_hip_run_with_records(monkeypatch, records=records)
+    runner = cascade_mod.SubprocessHipRunner(tmp_path, work_dir=tmp_path / "work")
+
+    # A single source with a duplicate source_row_index across two rounds is the
+    # real hip-run's shape for num_rounds>1; here the point is that round_k=2 does
+    # not filter to empty. (This parquet has a repeated index, so the loud
+    # duplicate guard fires -- proving the filter is gone AND the guard is honest.)
+    with pytest.raises(HipRunError) as exc_info:
+        runner.run_round({"fineweb-00000": "a draft"}, round_k=2, adapter_id="ADP")
+    # It failed on the DUPLICATE index (rows were read), not on an empty result
+    # from a round_k filter -- the message names the duplicate, not a missing pair.
+    assert "duplicate" in str(exc_info.value)
+
+    # And a clean single-round parquet (what num_rounds=1 actually writes: one row,
+    # always stamped round 1) resolves at round_k=2 without any filter dropping it.
+    single = [
+        {"source_row_index": 0, "round": 1, "output_text": "resolved at round two"},
+    ]
+    _install_fake_hip_run_with_records(monkeypatch, records=single)
+    out = runner.run_round({"fineweb-00000": "a draft"}, round_k=2, adapter_id="ADP")
+    assert out == {"fineweb-00000": "resolved at round two"}
+
+
+def test_subprocess_round_k_2_succeeds_end_to_end(tmp_path, monkeypatch):
+    """A full round_k=2 run through the real seam resolves the pair (regression).
+
+    Every other subprocess test drives round_k=1, which masks the round-filter bug
+    because hip-run's stamped round (1) then matches round_k (1). This drives a
+    round_k=2 invocation end to end through the standard fake (one row, stamped
+    round 1) and asserts the pair is resolved -- the exact case the old filter
+    turned into an empty result on the default 2-round run.
+    """
+    _install_fake_hip_run(monkeypatch, rewrite=lambda text, idx: f"{text} [k2]")
+    runner = cascade_mod.SubprocessHipRunner(tmp_path, work_dir=tmp_path / "work")
+    out = runner.run_round(
+        {"fineweb-00000": "a draft with words"}, round_k=2, adapter_id="ADP"
+    )
+    assert out == {"fineweb-00000": "a draft with words [k2]"}
+
+
+def test_subprocess_duplicate_source_row_index_fails_loudly(tmp_path, monkeypatch):
+    """A repeated source_row_index in the kept rows -> HipRunError, not clobber.
+
+    Two rows sharing a source_row_index would map to the same pair_id; a
+    last-write-wins assignment would silently attribute one pair's rewrite to
+    another and slip past the coverage/blank checks. The runner must fail loudly,
+    naming the duplicate.
+    """
+    records = [
+        {"source_row_index": 0, "round": 1, "output_text": "first rewrite"},
+        {"source_row_index": 0, "round": 1, "output_text": "clobbering rewrite"},
+    ]
+    _install_fake_hip_run_with_records(monkeypatch, records=records)
+    runner = cascade_mod.SubprocessHipRunner(tmp_path, work_dir=tmp_path / "work")
+    with pytest.raises(HipRunError) as exc_info:
+        runner.run_round({"fineweb-00000": "a draft"}, round_k=1, adapter_id="ADP")
+    assert "duplicate" in str(exc_info.value)
 
 
 # --- per-pair work dir keyed on pair_id (NIT 1) ------------------------------
