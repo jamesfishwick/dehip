@@ -130,6 +130,30 @@ def test_pool_cap_scales_with_target():
     assert corpus.pool_cap_for(2000) == 20_000  # target * factor
 
 
+def test_resolve_client_instantiates_a_class_factory():
+    # The CLI injects the client CLASS (a zero-arg factory), not an instance.
+    # PromptClient is @runtime_checkable, so isinstance(cls, PromptClient) is
+    # True for the class itself -- _resolve_client must still construct it.
+    class _Factory:
+        def generate_prompt(self, document: str, *, instruction: str, model: str) -> str:
+            return f"prompt for {document}"
+
+    resolved = corpus._resolve_client(_Factory)
+    assert isinstance(resolved, _Factory)  # an instance, not the class
+    assert not isinstance(resolved, type)
+    # And it is callable with the caller's real argument pattern.
+    assert resolved.generate_prompt("doc", instruction="i", model="m") == "prompt for doc"
+
+
+def test_resolve_client_returns_an_instance_unchanged():
+    class _Client:
+        def generate_prompt(self, document: str, *, instruction: str, model: str) -> str:
+            return "p"
+
+    inst = _Client()
+    assert corpus._resolve_client(inst) is inst
+
+
 # --- Personal side corpus ----------------------------------------------------
 
 

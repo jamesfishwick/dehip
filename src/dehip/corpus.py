@@ -457,6 +457,13 @@ def _resolve_client(client: PromptClient | Any) -> PromptClient:
     API-key requirement) is constructed only after the cost preflight passes and
     generation is about to start, never on a validation or gate rejection.
     """
+    # A class (the CLI's factory) must be checked BEFORE the isinstance below:
+    # PromptClient is @runtime_checkable, so isinstance(cls, PromptClient) is True
+    # for the class object itself (it has a generate_prompt attribute). Without
+    # this branch the class is returned unconstructed and calls bind self to the
+    # first positional argument.
+    if isinstance(client, type):
+        return client()
     if isinstance(client, PromptClient):
         return client
     if callable(client):
