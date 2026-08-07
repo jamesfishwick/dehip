@@ -626,3 +626,48 @@ def test_cli_later_set_failure_exits_3_no_artifacts(tmp_path, monkeypatch, capsy
     assert not out.exists()
     assert not out.with_suffix(".scores.jsonl").exists()
     assert "detector call failed" in capsys.readouterr().err
+
+
+# --- PangramClient response parsing (real SDK shape, surfaced by issue #16) ----
+
+
+class _FakePangramSDK:
+    """Stand-in for the real pangram SDK client: predict() returns the documented
+    fraction_* dict, so we lock the response parsing without a network call."""
+
+    def __init__(self, response):
+        self._response = response
+        self.calls = []
+
+    def predict(self, text, model=None):
+        self.calls.append((text, model))
+        return self._response
+
+
+def test_pangram_client_reads_fraction_human():
+    from dehip import detector
+
+    c = detector.PangramClient()
+    c._client = _FakePangramSDK({"fraction_human": 0.83, "fraction_ai": 0.17})
+    assert c.score_text("x") == 0.83
+    # model is passed explicitly (deprecation: omitting it is rejected after 2026-09-30)
+    assert c._client.calls == [("x", "default")]
+
+
+def test_pangram_client_falls_back_to_one_minus_fraction_ai():
+    from dehip import detector
+
+    c = detector.PangramClient()
+    c._client = _FakePangramSDK({"fraction_ai": 0.30})  # no fraction_human
+    assert abs(c.score_text("x") - 0.70) < 1e-9
+
+
+def test_pangram_client_missing_fields_fails_loudly():
+    import pytest
+
+    from dehip import detector
+
+    c = detector.PangramClient()
+    c._client = _FakePangramSDK({"unexpected": 1})
+    with pytest.raises(detector.DetectorCallError):
+        c.score_text("x")

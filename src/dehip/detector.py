@@ -254,24 +254,46 @@ class PangramClient:
     def score_text(self, text: str) -> float:
         """Return Pangram's human-probability for ``text``.
 
-        Pangram reports an *AI likelihood* in ``[0, 1]``; human-probability is its
-        complement (``1 - ai_likelihood``). Any transport/response failure is
+        Pangram's ``predict`` returns document-level fractions in ``[0, 1]``:
+        ``fraction_human`` (proportion classified human-written), ``fraction_ai``,
+        and ``fraction_ai_assisted``. Human-probability is ``fraction_human``
+        (falling back to ``1 - fraction_ai`` if only that is present). ``model``
+        is passed explicitly ("default") because omitting it is deprecated and
+        will be rejected after 2026-09-30. Any transport/response failure is
         normalized to :class:`DetectorCallError`; :func:`score_set` also range-
         checks the returned value, so an out-of-range reply never becomes a silent
         score.
         """
         client = self._ensure_client()
         try:
-            result = client.predict(text)
+            result = client.predict(text, model="default")
         except Exception as exc:
             raise DetectorCallError(f"pangram call failed: {exc}") from exc
+
+        def _field(name: str) -> Any:
+            if isinstance(result, dict):
+                return result.get(name)
+            return getattr(result, name, None)
+
+        human = _field("fraction_human")
+        if human is None:
+            ai = _field("fraction_ai")
+            if ai is None:
+                raise DetectorCallError(
+                    f"pangram response missing fraction_human/fraction_ai: {result!r}"
+                )
+            try:
+                return 1.0 - float(ai)
+            except (TypeError, ValueError) as exc:
+                raise DetectorCallError(
+                    f"pangram response invalid fraction_ai: {result!r}"
+                ) from exc
         try:
-            ai_likelihood = float(result["ai_likelihood"])
-        except (KeyError, TypeError, ValueError) as exc:
+            return float(human)
+        except (TypeError, ValueError) as exc:
             raise DetectorCallError(
-                f"pangram response missing/invalid ai_likelihood: {result!r}"
+                f"pangram response invalid fraction_human: {result!r}"
             ) from exc
-        return 1.0 - ai_likelihood
 
 
 class GPTZeroClient:

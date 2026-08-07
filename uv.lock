@@ -371,6 +371,7 @@ dependencies = [
     { name = "datasets" },
     { name = "numpy" },
     { name = "openai" },
+    { name = "pangram-sdk" },
     { name = "pyarrow" },
     { name = "pyyaml" },
     { name = "scipy" },
@@ -389,6 +390,7 @@ requires-dist = [
     { name = "datasets" },
     { name = "numpy" },
     { name = "openai" },
+    { name = "pangram-sdk", specifier = ">=1.0.0" },
     { name = "pyarrow" },
     { name = "pyyaml" },
     { name = "scipy" },
@@ -1204,6 +1206,19 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/fe/be/d448af7d657d82e1888dd8551f79c6d6fb161080b5b9752d84d910ec2319/pandas-3.0.5-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:b58b1b39d46a5862e3fb18f50d1a201398619d16a0f9f73f57eea5583cf0e63c", size = 11925105, upload-time = "2026-07-22T22:19:21.515Z" },
     { url = "https://files.pythonhosted.org/packages/29/c1/ccb4238212c8c4f496c584f3044d94e0c030ed8e1d68999db46c91c2242f/pandas-3.0.5-cp314-cp314t-win_amd64.whl", hash = "sha256:1c10461f6eeb35d8f05b6184c65c8b9991663b66c46b1d559b682cb34ae7c6ea", size = 10387612, upload-time = "2026-07-22T22:19:24.257Z" },
     { url = "https://files.pythonhosted.org/packages/d2/cf/6a51b2c38980e04c279fd2fa908a1b0982064e860444acfca4ec2e2c8359/pandas-3.0.5-cp314-cp314t-win_arm64.whl", hash = "sha256:3c5015fd1730fbf883647e88068176c839c102cea883ba1769a6f4593bfc1f8c", size = 9509776, upload-time = "2026-07-22T22:19:26.694Z" },
+]
+
+[[package]]
+name = "pangram-sdk"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "requests" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/10/94/4e78df78954d82fca0287b470ac702b49cef224362a4350117c9e232e97e/pangram_sdk-1.0.0.tar.gz", hash = "sha256:bb20ff297620cfb6041feaaac5deba177eea3f7695cabd2de845f422a8ab33af", size = 13414, upload-time = "2026-07-29T15:44:21.192Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5c/ff/e3fafd04ad703f0dfc727d36e5f71aaa52aa7777ee886a8173741e3fbfa1/pangram_sdk-1.0.0-py3-none-any.whl", hash = "sha256:0743c8fa13e0dbefc0375755e13e9bc4e7b91934e1f3db0407b8cbcee563b842", size = 13264, upload-time = "2026-07-29T15:44:20.187Z" },
 ]
 
 [[package]]

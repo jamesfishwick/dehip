@@ -12,6 +12,7 @@ dependencies = [
     "scipy",
     "pyarrow",
     "pyyaml",
+    "pangram-sdk>=1.0.0",
 ]
 
 [project.scripts]
