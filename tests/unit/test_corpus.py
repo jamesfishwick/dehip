@@ -135,19 +135,20 @@ def test_resolve_client_instantiates_a_class_factory():
     # PromptClient is @runtime_checkable, so isinstance(cls, PromptClient) is
     # True for the class itself -- _resolve_client must still construct it.
     class _Factory:
-        def generate_prompt(self, document: str, *, instruction: str, model: str) -> str:
+        def generate_prompt(self, document, *, instruction, model):
             return f"prompt for {document}"
 
     resolved = corpus._resolve_client(_Factory)
     assert isinstance(resolved, _Factory)  # an instance, not the class
     assert not isinstance(resolved, type)
     # And it is callable with the caller's real argument pattern.
-    assert resolved.generate_prompt("doc", instruction="i", model="m") == "prompt for doc"
+    out = resolved.generate_prompt("doc", instruction="i", model="m")
+    assert out == "prompt for doc"
 
 
 def test_resolve_client_returns_an_instance_unchanged():
     class _Client:
-        def generate_prompt(self, document: str, *, instruction: str, model: str) -> str:
+        def generate_prompt(self, document, *, instruction, model):
             return "p"
 
     inst = _Client()
