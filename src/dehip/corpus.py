@@ -49,6 +49,7 @@ Design invariants
 
 from __future__ import annotations
 
+import itertools
 import random
 import re
 from collections.abc import Iterable, Iterator
@@ -101,6 +102,19 @@ TIER_SIZES: dict[str, int] = {"smoke": 50, "judged": 400, "full": 2000}
 # Word-count band for the fineweb tier (data-model.md Pair.word_count).
 WORD_COUNT_MIN = 150
 WORD_COUNT_MAX = 1200
+
+# Bounded sampling pool. ``sample_documents`` draws the tier's sample from at most
+# this many qualified docs rather than materializing the whole (effectively
+# unbounded) FineWeb stream, which OOMs the process on the real dataset. The pool
+# is a seeded oversample of the target so the draw stays representative and
+# reproducible; the cap keeps memory O(pool), not O(dataset).
+POOL_OVERSAMPLE_FACTOR = 10
+MIN_POOL_SIZE = 500
+
+
+def pool_cap_for(target: int) -> int:
+    """Bounded qualified-doc pool size for a tier ``target``."""
+    return max(target * POOL_OVERSAMPLE_FACTOR, MIN_POOL_SIZE)
 
 # Prompt-variant rotation: each document draws one of these reverse-generation
 # instructions (round-robin by index) so the corpus carries a spread of prompt
@@ -337,14 +351,21 @@ def sample_documents(
     *,
     target: int,
     seed: int,
+    pool_cap: int | None = None,
 ) -> list[dict[str, Any]]:
     """Seeded sample of ``target`` qualified documents.
 
-    Materializes the qualified stream, then draws a reproducible sample with a
-    seeded RNG. Raises :class:`DocShortageError` when fewer than ``target``
-    documents qualified (FR-010 failure mode).
+    Materializes at most ``pool_cap`` qualified docs (default
+    :func:`pool_cap_for` of ``target``) via :func:`itertools.islice`, then draws a
+    reproducible sample with a seeded RNG. Bounding the pool is essential: the real
+    FineWeb stream is effectively unbounded, so ``list(qualified)`` would exhaust
+    memory. The seeded draw over a deterministic prefix stays reproducible. Raises
+    :class:`DocShortageError` when fewer than ``target`` documents qualified within
+    the cap (FR-010 failure mode).
     """
-    pool = list(qualified)
+    if pool_cap is None:
+        pool_cap = pool_cap_for(target)
+    pool = list(itertools.islice(qualified, pool_cap))
     if len(pool) < target:
         raise DocShortageError(requested=target, available=len(pool))
     rng = random.Random(seed)

@@ -100,6 +100,36 @@ def test_seeded_sample_is_reproducible(tmp_path):
     assert [p.reference_text for p in pairs_a] == [p.reference_text for p in pairs_b]
 
 
+def test_sample_documents_bounds_an_unbounded_stream():
+    # The real FineWeb stream is effectively endless. list(qualified) would hang
+    # (and OOM on the real dataset); islice(pool_cap) must bound it. This test
+    # would hang forever if sample_documents materialized the whole stream.
+    def endless():
+        i = 0
+        while True:
+            yield {
+                "text": f"doc {i}",
+                "word_count": 200,
+                "source": {"seq": i},
+                "register": "blog",
+            }
+            i += 1
+
+    sampled = corpus.sample_documents(endless(), target=5, seed=42, pool_cap=100)
+    assert len(sampled) == 5
+    # Reproducible over the deterministic prefix.
+    again = corpus.sample_documents(endless(), target=5, seed=42, pool_cap=100)
+    assert [d["text"] for d in sampled] == [d["text"] for d in again]
+    # Every pick came from within the cap (the first pool_cap qualified docs).
+    seqs = [d["source"]["seq"] for d in sampled]
+    assert all(0 <= s < 100 for s in seqs)
+
+
+def test_pool_cap_scales_with_target():
+    assert corpus.pool_cap_for(50) == 500  # MIN_POOL_SIZE floor
+    assert corpus.pool_cap_for(2000) == 20_000  # target * factor
+
+
 # --- Personal side corpus ----------------------------------------------------
 
 
