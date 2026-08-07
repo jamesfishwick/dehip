@@ -16,8 +16,9 @@ review:
   the round-loop state machine, degeneration gating, resumability, and manifest
   logic are exercised *without* shelling out, downloading models, or touching
   the HIP checkout. The real subprocess adapter (:class:`SubprocessHipRunner`)
-  is thin glue behind the seam: emit a YAML config, run one ``uv run hip-run``
-  round, marshal JSONL in and out.
+  is thin glue behind the seam: emit the real ``hip-run`` YAML config, run one
+  ``uv run hip-run --config`` round (input JSONL in, output parquet out), and
+  map the parquet's ``source_row_index`` back to each pair_id.
 
 - **The round loop stops at the LAST GOOD round on a hard degeneration trip.**
   Round 0 is the draft. Each round ``k`` (1-indexed) runs one ``hip-run``
@@ -109,9 +110,10 @@ class HipPreconditionError(RuntimeError):
 class HipRunError(RuntimeError):
     """Raised when a ``hip-run`` round fails or returns malformed/empty output.
 
-    Covers a non-zero subprocess exit, unparseable JSONL, a result missing a
-    pair the round was asked to rewrite, and an empty/whitespace-only rewrite
-    for any pair. Every one of these must fail loudly: a blank or missing
+    Covers a non-zero subprocess exit, an unreadable/missing output parquet, a
+    result missing a pair the round was asked to rewrite, and an
+    empty/whitespace-only rewrite for any pair. Every one of these must fail
+    loudly: a blank or missing
     rewrite silently persisted as a finished round would score downstream as a
     real (blank) rewrite -- the exact silent corruption ``generate.py``'s
     empty-draft guard exists to prevent. The CLI maps this to exit 3 (external
@@ -178,11 +180,24 @@ class SubprocessHipRunner:
     """Thin ``uv run hip-run`` glue behind the :class:`HipRunner` seam.
 
     Everything subprocess- and YAML-specific lives here so the round loop (and
-    every test) never shells out. For each round it writes a YAML config plus a
-    JSONL input file into a work dir, invokes ``uv run hip-run --config ...`` in
-    the HIP checkout, and parses the emitted JSONL back into ``{pair_id: text}``.
-    Any failure -- non-zero exit, unparseable output, a missing/blank rewrite --
-    is normalized to :class:`HipRunError` (-> CLI exit 3).
+    every test) never shells out. For each round it writes the REAL ``hip-run``
+    YAML config plus a JSONL input file into a work dir, invokes ``uv run hip-run
+    --config <cfg>`` (and NOTHING else -- ``hip-run``'s argparse defines only
+    ``--config``) in the HIP checkout, then reads the output PARQUET ``hip-run``
+    writes back into ``{pair_id: text}``. Any failure -- non-zero exit,
+    unreadable parquet, a missing/blank rewrite -- is normalized to
+    :class:`HipRunError` (-> CLI exit 3).
+
+    The config schema matches ``hip/inference.py`` verbatim: ``adapter_path``
+    (the HF adapter id, NOT ``adapter_id``), ``input_jsonl``, ``text_field``,
+    ``output_parquet``, ``metadata_json``, ``num_rounds`` (1 per invocation so
+    the cascade's inter-round degeneration checks run one round at a time), plus
+    sampling knobs. ``hip-run`` resolves relative config paths against the HIP
+    repo root, so ``input_jsonl``/``output_parquet``/``metadata_json`` are
+    written as ABSOLUTE paths (``dehip``'s work dir is in the dehip repo, not the
+    HIP repo). ``base_model`` is OMITTED by default so any adapter self-resolves
+    to its correct base via its ``PeftConfig``; it is only emitted when the
+    caller passes a ``base_model`` override.
 
     The precondition (:func:`check_hip_precondition`) must have passed before a
     real round runs; this class does not re-check it per round.
@@ -193,31 +208,49 @@ class SubprocessHipRunner:
         hip_repo: str | Path,
         *,
         work_dir: str | Path,
-        base_model: str = "Qwen/Qwen3-4B-Base",
-        timeout_s: float = 3600.0,
+        base_model: str | None = None,
+        timeout_s: float = 7200.0,
     ) -> None:
         self.hip_repo = Path(hip_repo)
         self.work_dir = Path(work_dir)
+        # base_model None => let hip-run infer the base from the adapter's
+        # PeftConfig (base_model_name_or_path). Only an explicit override is
+        # emitted into the config so an adapter never resolves to a wrong base.
         self.base_model = base_model
+        # CPU inference in float32 (hip-run's choose_dtype has no CUDA/MPS path
+        # on this machine) is slow, so the per-round timeout is generous.
         self.timeout_s = timeout_s
 
     def config_for(
         self, *, round_k: int, adapter_id: str, seed: int
     ) -> dict[str, Any]:
-        """Build the per-round hip-run config (one round, one adapter, one seed).
+        """Build the per-round hip-run AUDIT config (one round, one adapter, one seed).
 
-        Records the ``seed`` the harness controls so a resumed/reproduced run has
-        a non-empty audit trail on the field that matters for reproducibility.
-        This is the REQUESTED config passed to ``hip-run``, advisory for fields
-        ``hip-run`` may override, not a readback of what it applied.
+        Recorded verbatim in each bundle's ``hip_config`` (data-model.md). It is
+        the path-independent audit view of what ``hip-run`` was handed for
+        ``round_k``: ``adapter_path`` (the real key ``hip-run`` reads, mapped from
+        the harness ``adapter_id``), ``num_rounds`` 1, ``text_field`` ``"text"``,
+        and the harness-controlled ``seed``. ``base_model`` appears ONLY when an
+        override was passed to the constructor -- omitting it lets the adapter
+        self-resolve its base. The ``seed`` is recorded for the reproducibility
+        audit trail even though ``hip-run`` ignores it (its argparse has no seed
+        flag; it is advisory, like every field ``hip-run`` may override).
+
+        The full run-time config emitted to disk in :meth:`run_round` extends
+        this with the ABSOLUTE ``input_jsonl``/``output_parquet``/``metadata_json``
+        paths for the round; those are per-round file locations, not part of the
+        cross-round audit shape, so they live only in the on-disk config.
         """
-        return {
-            "rounds": 1,
+        config: dict[str, Any] = {
+            "adapter_path": adapter_id,
+            "num_rounds": 1,
             "round": round_k,
-            "adapter_id": adapter_id,
-            "base_model": self.base_model,
+            "text_field": "text",
             "seed": seed,
         }
+        if self.base_model is not None:
+            config["base_model"] = self.base_model
+        return config
 
     def run_round(
         self,
@@ -227,13 +260,21 @@ class SubprocessHipRunner:
         adapter_id: str,
         seed: int = 0,
     ) -> dict[str, str]:
-        """Emit a config + JSONL, run one ``hip-run`` round, parse the JSONL back.
+        """Emit config + input JSONL, run one ``hip-run`` round, parse the parquet.
 
-        Marshals ``inputs`` to a JSONL file, writes the round's YAML config,
-        invokes ``uv run hip-run --config <cfg> --input <in> --output <out>`` in
-        the HIP checkout, and reads the output JSONL into ``{pair_id: text}``.
-        Every failure mode -- process error, unreadable/unparseable output, a
-        pair the round did not rewrite, or a blank rewrite -- raises
+        Writes ``inputs`` as ``{"text": <draft>, "pair_id": <pid>}`` one JSON
+        object per line in a STABLE (pair_id) order -- ``hip-run`` reads the rows
+        in order and keys each output row back by ``source_row_index`` (its 0-based
+        input position), so the write order IS the mapping. Emits the real
+        ``hip-run`` YAML config with ABSOLUTE ``input_jsonl``/``output_parquet``/
+        ``metadata_json`` paths (``hip-run`` resolves relative config paths against
+        the HIP repo root, not dehip's work dir), invokes ``uv run hip-run
+        --config <cfg>`` (``--config`` ONLY -- passing ``--input``/``--output``
+        would make ``hip-run``'s argparse fail with "unrecognized arguments") in
+        the HIP checkout, then reads the output PARQUET into ``{pair_id: text}``.
+
+        Every failure mode -- process error, non-zero exit, unreadable/missing
+        parquet, a pair the round did not rewrite, or a blank rewrite -- raises
         :class:`HipRunError` so nothing blank is ever returned as real text.
 
         The per-round work dir is keyed on both the pair_id(s) and the round so
@@ -246,32 +287,36 @@ class SubprocessHipRunner:
         pair_tag = "-".join(_slug(pid) for pid in inputs) or "batch"
         round_dir = self.work_dir / f"pair-{pair_tag}" / f"round-{round_k}"
         round_dir.mkdir(parents=True, exist_ok=True)
+
+        # hip-run resolves relative config paths against its own repo root, so
+        # every path handed to it must be absolute (dehip's work dir is not under
+        # the HIP repo). resolve() makes them absolute + canonical.
+        config_path = round_dir / "config.yaml"
+        input_path = (round_dir / "input.jsonl").resolve()
+        output_path = (round_dir / "output.parquet").resolve()
+        metadata_path = (round_dir / "output.metadata.json").resolve()
+
+        # A STABLE pair_id order fixes source_row_index -> pair_id: row i of the
+        # input JSONL is the pair at ordered_ids[i], and hip-run stamps each
+        # output row with source_row_index == its input position.
+        ordered_ids = sorted(inputs)
+        with input_path.open("w", encoding="utf-8") as fh:
+            for pair_id in ordered_ids:
+                fh.write(json.dumps({"text": inputs[pair_id], "pair_id": pair_id}))
+                fh.write("\n")
+
         config = self.config_for(
             round_k=round_k, adapter_id=adapter_id, seed=seed
         )
-        config_path = round_dir / "config.yaml"
-        input_path = round_dir / "input.jsonl"
-        output_path = round_dir / "output.jsonl"
-
+        config["input_jsonl"] = str(input_path)
+        config["output_parquet"] = str(output_path)
+        config["metadata_json"] = str(metadata_path)
+        config["trust_remote_code"] = True
         config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
-        with input_path.open("w", encoding="utf-8") as fh:
-            for pair_id, text in inputs.items():
-                fh.write(json.dumps({"pair_id": pair_id, "text": text}))
-                fh.write("\n")
 
         try:
             proc = subprocess.run(
-                [
-                    "uv",
-                    "run",
-                    "hip-run",
-                    "--config",
-                    str(config_path),
-                    "--input",
-                    str(input_path),
-                    "--output",
-                    str(output_path),
-                ],
+                ["uv", "run", "hip-run", "--config", str(config_path.resolve())],
                 cwd=self.hip_repo,
                 capture_output=True,
                 text=True,
@@ -287,47 +332,72 @@ class SubprocessHipRunner:
                 f"{proc.stderr.strip() or proc.stdout.strip()}"
             )
 
-        return _parse_round_output(output_path, expected=set(inputs), round_k=round_k)
+        return _parse_round_output(
+            output_path, ordered_ids=ordered_ids, round_k=round_k
+        )
 
 
 def _parse_round_output(
-    output_path: Path, *, expected: set[str], round_k: int
+    output_path: Path, *, ordered_ids: list[str], round_k: int
 ) -> dict[str, str]:
-    """Parse a hip-run output JSONL into ``{pair_id: text}``, failing loudly.
+    """Parse a hip-run output PARQUET into ``{pair_id: text}``, failing loudly.
 
-    Raises :class:`HipRunError` if the file is missing/unreadable, a line is
-    unparseable, a pair the round was asked to rewrite is missing from the
-    output, or any rewrite is empty/whitespace-only. A blank or absent rewrite
-    is treated exactly like ``generate.py``'s empty-draft guard: loud failure,
-    never a silently-persisted blank.
+    ``hip-run`` writes a parquet (NOT a JSONL) with one row per input example per
+    round. The columns this reads: ``source_row_index`` (the 0-based position of
+    the row in the input JSONL -- the key back to the pair_id, since the caller
+    wrote the input in ``ordered_ids`` order), ``round`` (1-indexed; the cascade
+    runs ``num_rounds`` 1 so it reads the ``round == round_k`` rows), and
+    ``output_text`` (the rewrite). ``hip-run`` does NOT carry ``pair_id``, so the
+    mapping is purely positional: ``ordered_ids[source_row_index]``.
+
+    Raises :class:`HipRunError` if the parquet is missing/unreadable, lacks the
+    expected columns, a ``source_row_index`` is out of range, a pair the round
+    was asked to rewrite is absent from this round's rows, or any rewrite is
+    empty/whitespace-only. A blank or absent rewrite is treated exactly like
+    ``generate.py``'s empty-draft guard: loud failure, never a silently-persisted
+    blank.
     """
-    try:
-        raw_lines = output_path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
+    import pyarrow.parquet as pq  # local import: only the real path reads parquet
+
+    if not output_path.exists():
         raise HipRunError(
-            f"hip-run round {round_k} produced no readable output: {exc}"
+            f"hip-run round {round_k} produced no output parquet at {output_path}"
+        )
+    try:
+        table = pq.read_table(output_path)
+    except Exception as exc:  # noqa: BLE001 -- any parquet read failure is loud
+        raise HipRunError(
+            f"hip-run round {round_k} produced an unreadable output parquet "
+            f"at {output_path}: {exc}"
         ) from exc
 
-    result: dict[str, str] = {}
-    for line in raw_lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise HipRunError(
-                f"hip-run round {round_k} emitted an unparseable output line: {exc}"
-            ) from exc
-        pair_id = record.get("pair_id")
-        text = record.get("text")
-        if pair_id is None or text is None:
-            raise HipRunError(
-                f"hip-run round {round_k} output line lacks pair_id/text: {record!r}"
-            )
-        result[pair_id] = text
+    columns = set(table.column_names)
+    required = {"source_row_index", "round", "output_text"}
+    missing_cols = required - columns
+    if missing_cols:
+        raise HipRunError(
+            f"hip-run round {round_k} output parquet lacks column(s) "
+            f"{sorted(missing_cols)}; got {sorted(columns)}"
+        )
 
-    return _validate_round_result(result, expected=expected, round_k=round_k)
+    result: dict[str, str] = {}
+    for record in table.to_pylist():
+        if record["round"] != round_k:
+            continue  # hip-run emits one row per source row per round; take ours
+        source_index = record["source_row_index"]
+        if not isinstance(source_index, int) or not (
+            0 <= source_index < len(ordered_ids)
+        ):
+            raise HipRunError(
+                f"hip-run round {round_k} output parquet has an out-of-range "
+                f"source_row_index {source_index!r} (input had {len(ordered_ids)} rows)"
+            )
+        pair_id = ordered_ids[source_index]
+        result[pair_id] = record["output_text"]
+
+    return _validate_round_result(
+        result, expected=set(ordered_ids), round_k=round_k
+    )
 
 
 def _validate_round_result(

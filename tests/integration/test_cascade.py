@@ -60,8 +60,10 @@ Test map (each locks one DoD / adversarial-design item):
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
+import yaml as _yaml
 
 from dehip import cascade as cascade_mod
 from dehip import cli
@@ -1031,6 +1033,294 @@ def test_rounds_at_max_completes_successfully(tmp_path):
     assert bundle.final_round == 4
 
 
+# --- SubprocessHipRunner against the REAL hip-run config + parquet contract ---
+#
+# The tests below drive the REAL SubprocessHipRunner against a FAKE hip-run
+# instead of the mocked HipRunner seam the round-loop tests inject. The old
+# suite mocked the whole seam, which is exactly why the config/CLI/output-format
+# mismatch with the real hip-run was invisible until an issue #16 real run. A
+# fake hip-run reproduces the real I/O contract WITHOUT the model:
+#   - reads the --config YAML (the only CLI arg the real hip-run accepts),
+#   - asserts the REAL config keys (adapter_path, input_jsonl, output_parquet,
+#     text_field, num_rounds) are present,
+#   - reads input_jsonl (one {"text", "pair_id"} per line, IN ORDER),
+#   - writes an output PARQUET matching the real schema (source_row_index, round,
+#     original_text, input_text, output_text + word counts).
+# It is installed by monkeypatching cascade_mod.subprocess.run so `uv run
+# hip-run --config <cfg>` never shells out to the real CLI.
+
+
+def _install_fake_hip_run(
+    monkeypatch,
+    *,
+    rewrite=lambda text, idx: f"{text} [rewritten]",
+    drop_indices=(),
+    returncode=0,
+    stderr="",
+):
+    """Monkeypatch subprocess.run with a fake hip-run; return captured invocations.
+
+    ``rewrite(text, source_row_index) -> output_text`` scripts each row's
+    rewrite (return "" or "   " to script a blank). ``drop_indices`` omits those
+    source rows from the parquet (a pair the round did not rewrite).
+    ``returncode``/``stderr`` script a non-zero exit. Every fake run records the
+    config path + parsed config into the returned ``calls`` list so a test can
+    assert the exact CLI shape (``--config`` only) and config schema.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    calls: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        # The real hip-run argparse accepts ONLY --config: assert the CLI shape.
+        assert cmd[:3] == ["uv", "run", "hip-run"], cmd
+        assert cmd[3] == "--config", cmd
+        assert "--input" not in cmd and "--output" not in cmd, cmd
+        assert len(cmd) == 5, cmd  # uv run hip-run --config <path>, nothing else
+        config_path = cmd[4]
+        cfg = _yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+        calls.append({"cmd": list(cmd), "config": cfg, "cwd": kwargs.get("cwd")})
+
+        class _Proc:
+            pass
+
+        proc = _Proc()
+        proc.returncode = returncode
+        proc.stdout = ""
+        proc.stderr = stderr
+        if returncode != 0:
+            return proc
+
+        # The REAL config keys must be present (this is the contract under test).
+        real_keys = (
+            "adapter_path",
+            "input_jsonl",
+            "output_parquet",
+            "text_field",
+            "num_rounds",
+        )
+        for key in real_keys:
+            assert key in cfg, f"config missing real hip-run key {key!r}: {cfg}"
+        text_field = cfg["text_field"]
+        rows = [
+            json.loads(ln)
+            for ln in Path(cfg["input_jsonl"]).read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        records = []
+        for source_index, row in enumerate(rows):
+            if source_index in drop_indices:
+                continue
+            original = str(row.get(text_field) or "")
+            out = rewrite(original, source_index)
+            records.append(
+                {
+                    "source_row_index": source_index,
+                    "round": 1,
+                    "original_text": original,
+                    "input_text": original,
+                    "output_text": out,
+                    "original_word_count": len(original.split()),
+                    "input_word_count": len(original.split()),
+                    "output_word_count": len(out.split()),
+                }
+            )
+        out_path = Path(cfg["output_parquet"])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.Table.from_pylist(records), out_path)
+        return proc
+
+    monkeypatch.setattr(cascade_mod.subprocess, "run", fake_run)
+    return calls
+
+
+def test_subprocess_config_emits_real_hip_run_schema(tmp_path, monkeypatch):
+    """config_for emits the REAL hip-run keys; run_round writes them to the YAML.
+
+    Locks the config schema against hip/inference.py: adapter_path (NOT
+    adapter_id), num_rounds 1 (one round per invocation for inter-round
+    degeneration), text_field "text", the harness seed, and -- written by
+    run_round -- input_jsonl / output_parquet / metadata_json / trust_remote_code.
+    """
+    calls = _install_fake_hip_run(monkeypatch)
+    runner = cascade_mod.SubprocessHipRunner(tmp_path, work_dir=tmp_path / "work")
+
+    # config_for is the path-independent audit view recorded in hip_config.
+    audit = runner.config_for(round_k=1, adapter_id="an-adapter-id", seed=7)
+    assert audit["adapter_path"] == "an-adapter-id"
+    assert "adapter_id" not in audit  # the real key is adapter_path
+    assert audit["num_rounds"] == 1
+    assert audit["text_field"] == "text"
+    assert audit["seed"] == 7
+
+    runner.run_round(
+        {"fineweb-00000": "a draft with words"},
+        round_k=1,
+        adapter_id="an-adapter-id",
+    )
+    cfg = calls[0]["config"]
+    assert cfg["adapter_path"] == "an-adapter-id"
+    assert cfg["num_rounds"] == 1
+    assert cfg["text_field"] == "text"
+    assert cfg["trust_remote_code"] is True
+    for key in ("input_jsonl", "output_parquet", "metadata_json"):
+        assert key in cfg
+
+
+def test_subprocess_invokes_config_only(tmp_path, monkeypatch):
+    """run_round invokes `uv run hip-run --config <cfg>` and NOTHING else.
+
+    The real hip-run argparse defines only --config; --input/--output would fail
+    with "unrecognized arguments". The fake asserts the CLI shape internally, and
+    here we re-assert on the captured cmd so the invariant is explicit.
+    """
+    calls = _install_fake_hip_run(monkeypatch)
+    runner = cascade_mod.SubprocessHipRunner(tmp_path, work_dir=tmp_path / "work")
+    runner.run_round({"fineweb-00000": "text a"}, round_k=1, adapter_id="ADP")
+
+    cmd = calls[0]["cmd"]
+    assert cmd[:4] == ["uv", "run", "hip-run", "--config"]
+    assert len(cmd) == 5
+    assert "--input" not in cmd and "--output" not in cmd
+    assert calls[0]["cwd"] == tmp_path  # invoked in the HIP checkout
+
+
+def test_subprocess_parses_parquet_and_maps_source_row_index_to_pair_id(
+    tmp_path, monkeypatch
+):
+    """The parquet's source_row_index maps back to pair_id by input write order.
+
+    hip-run carries no pair_id; the mapping is positional. The runner writes the
+    input in a stable (sorted) pair_id order, so source_row_index i is
+    ordered_ids[i]. A rewrite keyed on its index proves each pair got ITS own
+    row, not a shuffled one.
+    """
+    # rewrite embeds the source index so a mis-map would surface as wrong text.
+    calls = _install_fake_hip_run(
+        monkeypatch, rewrite=lambda text, idx: f"{text} :: idx={idx}"
+    )
+    runner = cascade_mod.SubprocessHipRunner(tmp_path, work_dir=tmp_path / "work")
+
+    inputs = {
+        "fineweb-00002": "gamma draft",
+        "fineweb-00000": "alpha draft",
+        "fineweb-00001": "beta draft",
+    }
+    out = runner.run_round(inputs, round_k=1, adapter_id="ADP")
+
+    # Stable sorted order: 00000 -> idx 0, 00001 -> idx 1, 00002 -> idx 2.
+    assert out["fineweb-00000"] == "alpha draft :: idx=0"
+    assert out["fineweb-00001"] == "beta draft :: idx=1"
+    assert out["fineweb-00002"] == "gamma draft :: idx=2"
+    # The input JSONL carried {"text", "pair_id"} rows in that stable order.
+    input_path = Path(calls[0]["config"]["input_jsonl"])
+    written = [
+        json.loads(ln)
+        for ln in input_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [r["pair_id"] for r in written] == [
+        "fineweb-00000",
+        "fineweb-00001",
+        "fineweb-00002",
+    ]
+    assert all("text" in r for r in written)
+
+
+def test_subprocess_emitted_paths_are_absolute(tmp_path, monkeypatch):
+    """input_jsonl / output_parquet / metadata_json in the config are ABSOLUTE.
+
+    hip-run resolves relative config paths against ITS repo root, not dehip's
+    work dir, so relative paths would land in the wrong place. Every path key
+    must be absolute.
+    """
+    calls = _install_fake_hip_run(monkeypatch)
+    runner = cascade_mod.SubprocessHipRunner(tmp_path, work_dir=tmp_path / "work")
+    runner.run_round({"fineweb-00000": "a draft"}, round_k=1, adapter_id="ADP")
+
+    cfg = calls[0]["config"]
+    for key in ("input_jsonl", "output_parquet", "metadata_json"):
+        assert Path(cfg[key]).is_absolute(), f"{key} is not absolute: {cfg[key]}"
+
+
+def test_subprocess_config_omits_base_model_by_default(tmp_path, monkeypatch):
+    """config_for OMITS base_model by default so the adapter self-resolves.
+
+    hip-run infers the base from the adapter's PeftConfig when base_model is
+    absent, so the 0.6B adapter resolves to Qwen/Qwen3-0.6B-Base and the 4B to
+    its own base. Emitting a fixed base_model would force a wrong base for any
+    other-sized adapter.
+    """
+    calls = _install_fake_hip_run(monkeypatch)
+    runner = cascade_mod.SubprocessHipRunner(tmp_path, work_dir=tmp_path / "work")
+    audit = runner.config_for(round_k=1, adapter_id="ADP", seed=0)
+    assert "base_model" not in audit
+
+    runner.run_round({"fineweb-00000": "a draft"}, round_k=1, adapter_id="ADP")
+    assert "base_model" not in calls[0]["config"]
+
+
+def test_subprocess_config_includes_base_model_when_overridden(tmp_path, monkeypatch):
+    """An explicit base_model override IS emitted (the only case it appears)."""
+    calls = _install_fake_hip_run(monkeypatch)
+    runner = cascade_mod.SubprocessHipRunner(
+        tmp_path, work_dir=tmp_path / "work", base_model="Qwen/Qwen3-4B-Base"
+    )
+    audit = runner.config_for(round_k=1, adapter_id="ADP", seed=0)
+    assert audit["base_model"] == "Qwen/Qwen3-4B-Base"
+
+    runner.run_round({"fineweb-00000": "a draft"}, round_k=1, adapter_id="ADP")
+    assert calls[0]["config"]["base_model"] == "Qwen/Qwen3-4B-Base"
+
+
+def test_subprocess_missing_pair_row_fails_loudly(tmp_path, monkeypatch):
+    """A parquet omitting a requested pair's row -> HipRunError (never a skip)."""
+    _install_fake_hip_run(monkeypatch, drop_indices=(1,))
+    runner = cascade_mod.SubprocessHipRunner(tmp_path, work_dir=tmp_path / "work")
+    with pytest.raises(HipRunError):
+        runner.run_round(
+            {"fineweb-00000": "alpha", "fineweb-00001": "beta"},
+            round_k=1,
+            adapter_id="ADP",
+        )
+
+
+def test_subprocess_blank_output_text_fails_loudly(tmp_path, monkeypatch):
+    """A blank/whitespace output_text -> HipRunError, never a silent blank round."""
+    _install_fake_hip_run(monkeypatch, rewrite=lambda text, idx: "   ")
+    runner = cascade_mod.SubprocessHipRunner(tmp_path, work_dir=tmp_path / "work")
+    with pytest.raises(HipRunError):
+        runner.run_round({"fineweb-00000": "alpha"}, round_k=1, adapter_id="ADP")
+
+
+def test_subprocess_nonzero_exit_fails_loudly(tmp_path, monkeypatch):
+    """A non-zero hip-run exit -> HipRunError carrying the stderr."""
+    _install_fake_hip_run(
+        monkeypatch, returncode=1, stderr="hip-run: boom"
+    )
+    runner = cascade_mod.SubprocessHipRunner(tmp_path, work_dir=tmp_path / "work")
+    with pytest.raises(HipRunError) as exc_info:
+        runner.run_round({"fineweb-00000": "alpha"}, round_k=1, adapter_id="ADP")
+    assert "boom" in str(exc_info.value)
+
+
+def test_subprocess_missing_parquet_fails_loudly(tmp_path, monkeypatch):
+    """A clean exit that writes NO parquet -> HipRunError (missing output)."""
+
+    def fake_run(cmd, **kwargs):
+        class _Proc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _Proc()  # exits 0 but writes nothing
+
+    monkeypatch.setattr(cascade_mod.subprocess, "run", fake_run)
+    runner = cascade_mod.SubprocessHipRunner(tmp_path, work_dir=tmp_path / "work")
+    with pytest.raises(HipRunError):
+        runner.run_round({"fineweb-00000": "alpha"}, round_k=1, adapter_id="ADP")
+
+
 # --- per-pair work dir keyed on pair_id (NIT 1) ------------------------------
 
 
@@ -1039,39 +1329,20 @@ def test_subprocess_work_dirs_are_per_pair(tmp_path, monkeypatch):
 
     The SubprocessHipRunner's per-round work dir includes the pair_id, so one
     pair's subprocess input/config/output survive rather than being overwritten by
-    the next pair at the same round. We drive the seam through a fake subprocess so
+    the next pair at the same round. We drive the seam through a fake hip-run so
     no real hip-run is invoked, and assert each pair produced its own audit dir.
     """
     work_dir = tmp_path / "hip-work"
     runner = cascade_mod.SubprocessHipRunner(tmp_path, work_dir=work_dir)
+    calls = _install_fake_hip_run(monkeypatch)
 
-    from pathlib import Path as _Path
-
-    captured_dirs: list[str] = []
-
-    def fake_run(cmd, **kwargs):
-        # cmd is [..., "--output", <path>]; echo the input back as the output so
-        # the parser succeeds, and record which work dir was used.
-        out_path = _Path(cmd[cmd.index("--output") + 1])
-        in_path = _Path(cmd[cmd.index("--input") + 1])
-        captured_dirs.append(str(out_path.parent))
-        # Copy input to output verbatim (each line already {pair_id, text}).
-        out_path.write_text(in_path.read_text(encoding="utf-8"), encoding="utf-8")
-
-        class _Proc:
-            returncode = 0
-            stdout = ""
-            stderr = ""
-
-        return _Proc()
-
-    monkeypatch.setattr(cascade_mod.subprocess, "run", fake_run)
     runner.run_round({"fineweb-00000": "text a"}, round_k=1, adapter_id="ADP")
     runner.run_round({"fineweb-00001": "text b"}, round_k=1, adapter_id="ADP")
 
     # Two DISTINCT per-pair round-1 work dirs, both surviving on disk.
-    assert len(set(captured_dirs)) == 2
+    out_dirs = {Path(c["config"]["output_parquet"]).parent for c in calls}
+    assert len(out_dirs) == 2
     surviving = {p.name for p in work_dir.iterdir() if p.is_dir()}
     assert len(surviving) == 2
-    for d in captured_dirs:
-        assert _Path(d).exists()
+    for d in out_dirs:
+        assert d.exists()
