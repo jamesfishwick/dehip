@@ -285,6 +285,10 @@ def _add_rewrite(subparsers: argparse._SubParsersAction) -> None:
     )
     parser.add_argument("--adapter", default="YixuanEvenXu/Qwen3-4B-Base-HIP-adapter")
     parser.add_argument("--rounds", type=int, default=2, help="Max 4.")
+    # Sampling knobs hip-run actually applies (inference.py:118-120). Defaults
+    # match the HIP inference protocol (temperature 1.0, top_p 0.95).
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-p", type=float, default=0.95, dest="top_p")
     parser.add_argument(
         "--hip-repo", default="../humanization-by-iterative-paraphrasing"
     )
@@ -365,7 +369,10 @@ def _run_rewrite(args: argparse.Namespace) -> int:
     # after the precondition passed, and its per-round subprocess is the only
     # place that shells out.
     runner = cascade_mod.SubprocessHipRunner(
-        args.hip_repo, work_dir=Path(run_dir) / "hip-work"
+        args.hip_repo,
+        work_dir=Path(run_dir) / "hip-work",
+        temperature=args.temperature,
+        top_p=args.top_p,
     )
     try:
         summary = cascade_mod.run_cascade(
