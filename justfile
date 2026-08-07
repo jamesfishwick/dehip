@@ -16,6 +16,12 @@ smoke_run := "results/runs/smoke"
 default:
     @just --list
 
+# Lint the package with ruff. The global pre-commit hook detects this recipe
+# (`just lint`) and blocks a commit when it fails, so ruff is gated at commit
+# time, not just in CI.
+lint:
+    uv run ruff check .
+
 # The cascade's `dehip rewrite` shells out to `uv run hip-run` in this checkout.
 # Clone the HIP sibling checkout next to this repo and install its deps.
 clone-hip:
