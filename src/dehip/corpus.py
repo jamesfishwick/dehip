@@ -50,6 +50,7 @@ Design invariants
 from __future__ import annotations
 
 import itertools
+import json
 import random
 import re
 from collections.abc import Iterable, Iterator
@@ -686,12 +687,39 @@ def write_human_reference_manifest(
         raise CorpusError(
             f"manifest corpus must be homogeneous, got {sorted(corpora)}"
         )
+    manifest_path = Path(manifest_path)
+    # The score/self-check/detect readers consume a {pair_id, text} JSONL (the
+    # TextSet convention, mirroring generate.py's draft-texts). The Pair JSONL
+    # stores the human text under ``reference_text``, so write a companion texts
+    # file projecting reference_text -> text and point provenance at it. Without
+    # this the reader falls back to the Pair JSONL and KeyErrors on ``text``.
+    name = manifest_path.name
+    if name.endswith(".manifest.json"):
+        stem = name[: -len(".manifest.json")]
+    else:
+        stem = manifest_path.stem
+    texts_name = f"{stem}-texts.jsonl"
+    texts_path = manifest_path.parent / texts_name
+    texts_path.parent.mkdir(parents=True, exist_ok=True)
+    with texts_path.open("w", encoding="utf-8") as fh:
+        for pair in pairs:
+            record = {
+                "schema_version": 1,
+                "pair_id": pair.pair_id,
+                "text": pair.reference_text,
+            }
+            fh.write(json.dumps(record, ensure_ascii=False))
+            fh.write("\n")
     manifest = TextSet(
         set_id=set_id,
         role="human_reference",
         corpus=next(iter(corpora)),
         pair_ids=[pair.pair_id for pair in pairs],
-        provenance={"builder": "dehip build-corpus", "count": len(pairs)},
+        provenance={
+            "builder": "dehip build-corpus",
+            "count": len(pairs),
+            "texts_path": texts_name,
+        },
     )
     write_json(manifest, manifest_path)
     return manifest

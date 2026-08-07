@@ -155,6 +155,35 @@ def test_resolve_client_returns_an_instance_unchanged():
     assert corpus._resolve_client(inst) is inst
 
 
+def test_reference_manifest_is_readable_by_the_score_reader(tmp_path):
+    # The human_reference manifest build-corpus writes must be consumable by the
+    # score/self-check/detect reader, which expects a {pair_id, text} texts file.
+    # The Pair JSONL stores the text as reference_text; without the companion
+    # texts file the reader KeyErrors on 'text'. This locks the cross-module
+    # contract (surfaced by the issue #16 real run).
+    from dehip import report
+
+    def _pair(pid, text, reg):
+        return Pair(
+            pair_id=pid, corpus="fineweb", prompt=f"prompt {pid}",
+            reference_text=text, source={"seq": pid}, register=reg,
+            prompt_generator="stub", word_count=len(text.split()),
+        )
+
+    pairs = [_pair("fineweb-00000", "human text zero", "blog"),
+             _pair("fineweb-00001", "human text one", "news")]
+    mpath = tmp_path / "c.manifest.json"
+    manifest = corpus.write_human_reference_manifest(
+        pairs, set_id="fineweb-2-human", manifest_path=mpath
+    )
+    texts_path = report._texts_path_for(mpath, manifest.provenance)
+    texts = report._read_pair_texts(texts_path)
+    assert texts == {
+        "fineweb-00000": "human text zero",
+        "fineweb-00001": "human text one",
+    }
+
+
 # --- Personal side corpus ----------------------------------------------------
 
 
