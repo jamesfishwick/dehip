@@ -118,8 +118,17 @@ class TransformersEmbedder:
             device, dtype = "cpu", torch.float32
 
         self._device = device
-        self._tokenizer = AutoTokenizer.from_pretrained(self.embedder_id)
-        self._model = AutoModel.from_pretrained(self.embedder_id, torch_dtype=dtype)
+        # The R4-pinned embedder (nvidia/llama-embed-nemotron-8b) is a custom
+        # `llama_bidirec` architecture that ships its own modeling code, so it
+        # loads only with trust_remote_code=True. Without it, from_pretrained
+        # prompts for interactive approval and EOFs in a non-interactive shell.
+        # This is the exact-protocol instrument from a trusted source (NVIDIA).
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            self.embedder_id, trust_remote_code=True
+        )
+        self._model = AutoModel.from_pretrained(
+            self.embedder_id, torch_dtype=dtype, trust_remote_code=True
+        )
         self._model.to(device)
         self._model.eval()
 
