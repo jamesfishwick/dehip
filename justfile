@@ -58,6 +58,20 @@ smoke-test:
         --rewrite-report results/reports/smoke-rewrite-k2.json --benchmark \
         --out results/reports/smoke-comparison.json
 
+# Render the smoke-run findings to a branded PDF (Palatino body, Menlo code).
+# Needs pandoc + a xelatex-capable TeX (macOS: MacTeX/BasicTeX). The `#` in
+# "issue #16" is a LaTeX macro char, so the subtitle spells it out.
+render-findings:
+    pandoc docs/smoke-run-findings.md \
+        --pdf-engine=xelatex \
+        -V geometry:margin=1in \
+        -V mainfont="Palatino" -V monofont="Menlo" -V fontsize=11pt \
+        -V colorlinks=true -V linkcolor=RoyalBlue -V urlcolor=RoyalBlue \
+        -V title="dehip: Smoke Run Findings" \
+        -V subtitle="HIP cascade harness (0.6B and 4B), issue 16" \
+        -V author="James Fishwick" -V date="2026-08-07" \
+        -o docs/smoke-run-findings.pdf
+
 # No-op formatter mirror; real one is in the Makefile for the pre-commit hook.
 format:
     @true
