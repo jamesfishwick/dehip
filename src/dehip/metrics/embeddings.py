@@ -45,6 +45,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 DEFAULT_CACHE_DIR = Path("data/emb-cache")
+# Env override for the cache dir, resolved at EmbeddingCache construction time.
+# Lets tests isolate the cache to a tmp dir (see tests/conftest.py) and lets a
+# real run relocate it off the shared default.
+CACHE_DIR_ENV = "DEHIP_EMB_CACHE_DIR"
 DEFAULT_EMBEDDER_ID = "nvidia/llama-embed-nemotron-8b"
 
 # Vectors are stored deliberately as float32: it is the precision the Embedder
@@ -206,7 +210,7 @@ class EmbeddingCache:
         self,
         embed_fn: Embedder,
         *,
-        cache_dir: Path | str = DEFAULT_CACHE_DIR,
+        cache_dir: Path | str | None = None,
     ) -> None:
         embedder_id = getattr(embed_fn, "embedder_id", None)
         if not embedder_id:
@@ -217,6 +221,13 @@ class EmbeddingCache:
             )
         self._embed_fn = embed_fn
         self._embedder_id = embedder_id
+        # When no cache_dir is passed, resolve the env override at construction
+        # time (not import time) so a per-test fixture can point every
+        # CLI-constructed cache at a tmp dir. The real store lives under
+        # data/emb-cache by default; DEHIP_EMB_CACHE_DIR relocates it (also lets
+        # a real run and the test suite avoid colliding on the shared default).
+        if cache_dir is None:
+            cache_dir = os.environ.get(CACHE_DIR_ENV, str(DEFAULT_CACHE_DIR))
         self._cache_dir = Path(cache_dir)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._index_path = self._cache_dir / "index.parquet"

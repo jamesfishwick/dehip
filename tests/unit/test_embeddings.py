@@ -301,3 +301,23 @@ def test_embed_fn_without_embedder_id_raises(tmp_path):
 
     with pytest.raises(ValueError, match="embedder_id"):
         EmbeddingCache(NoIdEmbedder(), cache_dir=tmp_path / "emb-cache")
+
+
+# --- cache-dir env override (test isolation, issue #16 follow-up) --------------
+
+
+def test_cache_dir_resolves_from_env(tmp_path, monkeypatch):
+    from dehip.metrics.embeddings import CACHE_DIR_ENV
+
+    custom = tmp_path / "from-env"
+    monkeypatch.setenv(CACHE_DIR_ENV, str(custom))
+    cache = EmbeddingCache(StubEmbedder())  # no explicit cache_dir -> reads env
+    assert cache._cache_dir == custom
+
+
+def test_explicit_cache_dir_beats_env(tmp_path, monkeypatch):
+    from dehip.metrics.embeddings import CACHE_DIR_ENV
+
+    monkeypatch.setenv(CACHE_DIR_ENV, str(tmp_path / "env"))
+    cache = EmbeddingCache(StubEmbedder(), cache_dir=tmp_path / "explicit")
+    assert cache._cache_dir == tmp_path / "explicit"
