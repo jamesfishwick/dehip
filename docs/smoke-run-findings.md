@@ -139,9 +139,15 @@ it visible.
 
 ## Known follow-ups
 
-- Test isolation: the score and self-check CLI tests default to the real
-  `data/emb-cache/`, so a real run's dim-4096 vectors collide with the stub tests'
-  dim-4 vectors. Tests should use a tmp cache dir.
+- DONE (a502641): test isolation. The score and self-check CLI tests defaulted to
+  the real `data/emb-cache/`, so a real run's dim-4096 vectors collided with the
+  stub tests' dim-4 vectors. Fixed with a `DEHIP_EMB_CACHE_DIR` override and an
+  autouse conftest fixture that points every test at a tmp cache dir.
+- DONE (2c3a2a0): `bounds.py` `REAL_INSTRUMENT_BOUNDS` filled from this run's
+  self-check (MMD 0.000307, token-L2 0.0221) with generous single-run margins.
+  `documented()` is now instrument-aware, selecting the real bounds only for the
+  real embedder and the stub bounds otherwise. Still open: re-derive over multiple
+  seeds (like the stub's 24) for tight bounds instead of one observation.
 - SC-004/SC-005 pass and the real quality verdict need the 4B (or larger) adapter.
-- `bounds.py` `REAL_INSTRUMENT_BOUNDS` can be filled from this run's self-check
-  (MMD ~0.0003, token-L2 ~0.022).
+  The 4B run cleared SC-005; an 8B or 14B GPU run would test whether the JMQ
+  penalty crosses into quality-neutral.
