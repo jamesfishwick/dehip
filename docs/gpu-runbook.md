@@ -56,6 +56,37 @@ FineWeb corpus and the same drafts the Mac produced, then rewrites them with the
 8B adapter. Swap `8B` for `14B` to run the larger tier. The two are independent;
 run whichever the hardware fits.
 
+## Cloud quickstart (rent, do not buy)
+
+You do not need to own a GPU. The run is seeded and reproducible, so a rented box
+rebuilds the same corpus and drafts, runs, and you tear it down. Pick a card by
+tier: 8B wants ~24GB VRAM, 14B wants ~40GB or more.
+
+| Provider | Best for | Card and cost |
+|---|---|---|
+| RunPod | cheapest 8B run | RTX 4090 / 3090 24GB, ~$0.30-0.80/hr |
+| Vast.ai | cheapest overall | 24GB cards, often cheaper spot |
+| Lambda Labs | 14B in one shot | A100 40GB, ~$1.10/hr |
+
+A 50-pair, two-round run is minutes to an hour on a GPU (versus the CPU few
+hours), so the whole thing is a few dollars: roughly $1-3 for 8B, $3-8 for 14B on
+an A100, plus the small OpenAI JMQ judge spend and Pangram.
+
+On a fresh RunPod or Vast pod (choose a PyTorch/CUDA template so torch and CUDA
+are already installed):
+
+```
+curl -LsSf https://astral.sh/uv/install.sh | sh   # if uv is absent
+git clone <your dehip remote> && cd dehip
+just clone-hip
+just fetch-adapter 8B
+export OPENAI_API_KEY=...  PANGRAM_API_KEY=...  HF_TOKEN=...
+just run-cascade 8B                               # hip-run auto-detects the GPU
+```
+
+`HF_TOKEN` only matters if the FineWeb stream or an adapter download rate-limits.
+`PANGRAM_API_KEY` is only needed if you also run `dehip detect`.
+
 ## Output
 
 Each run writes three reports under `results/reports/`, tagged by size:
