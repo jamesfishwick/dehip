@@ -32,7 +32,24 @@ build-backend = "hatchling.build"
 packages = ["src/dehip"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W", "UP", "B"]
+# E/F/I/W/UP/B: style, pyflakes, imports, pyupgrade, bugbear.
+# S: flake8-bandit security lint -- this code spawns a subprocess, sets
+#    trust_remote_code, and handles API keys, so a security regression gate earns
+#    its keep. C90: mccabe complexity ceiling (see [tool.ruff.lint.mccabe]).
+select = ["E", "F", "I", "W", "UP", "B", "S", "C90"]
+# Each ignore is a reviewed, categorical non-issue in THIS codebase, not a blanket
+# silencing. S101: asserts here are only type-narrowing / internal invariants, never
+# input validation (validate.py raises typed errors for that). S311: random drives
+# corpus sampling and pair splitting, never anything cryptographic. S603/S607: the
+# only subprocess is a fixed list-arg `uv run hip-run` call (no shell, no untrusted
+# command input; tool names resolved from PATH by design). S110 stays ON -- the two
+# benign import-capability probes carry a targeted noqa instead.
+ignore = ["S101", "S311", "S603", "S607"]
+
+[tool.ruff.lint.mccabe]
+# Ratchet at the current ceiling (_run_detect, 16). New code may not exceed the
+# worst function that exists today; reduce this over time as those four simplify.
+max-complexity = 16
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

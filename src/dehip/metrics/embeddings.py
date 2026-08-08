@@ -50,6 +50,14 @@ DEFAULT_CACHE_DIR = Path("data/emb-cache")
 # real run relocate it off the shared default.
 CACHE_DIR_ENV = "DEHIP_EMB_CACHE_DIR"
 DEFAULT_EMBEDDER_ID = "nvidia/llama-embed-nemotron-8b"
+# Pin the exact commit the embedder loads. This model loads with
+# trust_remote_code=True (custom llama_bidirec architecture), which executes the
+# repo's own Python at load. Pinning the revision is the mitigation: a compromised
+# or updated upstream cannot ship NEW code into a run bound to this SHA, and it
+# also makes MMD reproducible (the noise bounds in metrics/bounds.py were derived
+# against this exact revision). This is the commit that produced the issue-#16
+# smoke run. Bump it deliberately, never silently.
+DEFAULT_EMBEDDER_REVISION = "aa3b43a495a9b280d1bdb716da37c54bb495d630"
 
 # Vectors are stored deliberately as float32: it is the precision the Embedder
 # protocol promises, it halves the on-disk footprint versus float64, and it is
@@ -98,10 +106,12 @@ class TransformersEmbedder:
         self,
         model_name: str = DEFAULT_EMBEDDER_ID,
         *,
+        revision: str | None = DEFAULT_EMBEDDER_REVISION,
         batch_size: int = 8,
         max_length: int = 512,
     ) -> None:
         self.embedder_id = model_name
+        self.revision = revision
         self.batch_size = batch_size
         self.max_length = max_length
         self._model = None
@@ -127,11 +137,16 @@ class TransformersEmbedder:
         # loads only with trust_remote_code=True. Without it, from_pretrained
         # prompts for interactive approval and EOFs in a non-interactive shell.
         # This is the exact-protocol instrument from a trusted source (NVIDIA).
+        # `revision` pins the commit so trust_remote_code cannot pull new code
+        # from a changed upstream (see DEFAULT_EMBEDDER_REVISION).
         self._tokenizer = AutoTokenizer.from_pretrained(
-            self.embedder_id, trust_remote_code=True
+            self.embedder_id, revision=self.revision, trust_remote_code=True
         )
         self._model = AutoModel.from_pretrained(
-            self.embedder_id, torch_dtype=dtype, trust_remote_code=True
+            self.embedder_id,
+            revision=self.revision,
+            torch_dtype=dtype,
+            trust_remote_code=True,
         )
         self._model.to(device)
         self._model.eval()

@@ -58,6 +58,7 @@ from dehip.schemas import (
 
 __all__ = [
     "DEFAULT_MODEL",
+    "DEFAULT_MODEL_REVISION",
     "DEFAULT_TEMPERATURE",
     "DEFAULT_TOP_P",
     "ModelLoadError",
@@ -74,6 +75,12 @@ __all__ = [
 # The 8B variant is configurable via --model; Qwen/Qwen3-8B is the valid 8B repo
 # (there is no Qwen3-8B-Instruct-2507 -- that id 401s).
 DEFAULT_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+# Pin the draft model's commit so the drafts a run produces are reproducible (the
+# whole cascade is seeded, and the smoke-run results assume this exact revision).
+# No trust_remote_code here -- Qwen is a standard architecture -- so this is a
+# reproducibility pin, not a code-trust one. Applies only to the default model; a
+# custom --model uses whatever revision that id resolves to. Bump deliberately.
+DEFAULT_MODEL_REVISION = "cdbee75f17c01a7cc42f958dc650907174af0554"
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_TOP_P = 0.95
 
@@ -158,8 +165,19 @@ class TransformersDraftModel:
     MPS -> CUDA -> CPU.
     """
 
-    def __init__(self, model_id: str, *, max_new_tokens: int = 1024) -> None:
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        revision: str | None = None,
+        max_new_tokens: int = 1024,
+    ) -> None:
         self.model_id = model_id
+        # Auto-pin the default model to its known-good revision; a custom --model
+        # stays unpinned unless the caller passes an explicit revision.
+        if revision is None and model_id == DEFAULT_MODEL:
+            revision = DEFAULT_MODEL_REVISION
+        self.revision = revision
         self.max_new_tokens = max_new_tokens
         self._model: Any = None
         self._tokenizer: Any = None
@@ -200,9 +218,12 @@ class TransformersDraftModel:
             from transformers import AutoModelForCausalLM, AutoTokenizer
 
             self._device = self._autodetect_device()
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.model_id, revision=self.revision
+            )
             self._model = AutoModelForCausalLM.from_pretrained(
                 self.model_id,
+                revision=self.revision,
                 torch_dtype=torch.float32 if self._device == "cpu" else "auto",
             )
             self._model.to(self._device)

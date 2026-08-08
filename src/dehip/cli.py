@@ -477,14 +477,14 @@ def _external_dep_exc_types() -> tuple[type[BaseException], ...]:
         from dehip.metrics.embeddings import CacheIntegrityError
 
         types.append(CacheIntegrityError)
-    except Exception:  # pragma: no cover - embeddings always importable here
-        pass
+    except Exception:  # noqa: S110  # pragma: no cover - embeddings always importable
+        pass  # optional import probe: absence just means no extra error type to add
     try:
         import openai
 
         types.append(openai.OpenAIError)  # incl. missing OPENAI_API_KEY at construct
-    except Exception:  # openai SDK not installed: nothing to add
-        pass
+    except Exception:  # noqa: S110  # openai SDK not installed: nothing to add
+        pass  # optional import probe: absence just means no extra error type to add
     return tuple(types)
 
 
