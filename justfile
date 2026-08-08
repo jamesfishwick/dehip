@@ -58,6 +58,39 @@ smoke-test:
         --rewrite-report results/reports/smoke-rewrite-k2.json --benchmark \
         --out results/reports/smoke-comparison.json
 
+# Run the full cascade end to end with a chosen adapter size, tagged by size.
+# hip-run auto-selects CUDA when a GPU is present (never MPS), so the SAME command
+# that smoke-tested the 0.6B/4B on CPU here scales to 8B/14B on a GPU box with no
+# code change -- only the hardware differs. Fetch the adapter first
+# (`just fetch-adapter 8B`), then `just run-cascade 8B`. The run is seeded, so a
+# fresh box reproduces the same corpus and drafts. See docs/gpu-runbook.md for the
+# VRAM/RAM sizing per adapter and the OPENAI_API_KEY the JMQ judge needs.
+run-cascade size="8B":
+    uv sync
+    uv run dehip --seed 42 build-corpus --tier smoke --corpus fineweb \
+        --out {{smoke_corpus}}
+    uv run dehip self-check --reference {{smoke_manifest}} --skip-jmq
+    uv run dehip --seed 42 generate --corpus {{smoke_corpus}} \
+        --out results/runs/{{size}}
+    uv run dehip rewrite --run results/runs/{{size}} --rounds 2 \
+        --adapter adapters/Qwen3-{{size}}-Base-HIP-adapter --hip-repo {{hip_dir}}
+    uv run dehip score --candidate results/runs/{{size}}/draft.manifest.json \
+        --reference {{smoke_manifest}} --prompts {{smoke_corpus}} --yes \
+        --out results/reports/{{size}}-draft.json
+    uv run dehip score --candidate results/runs/{{size}}/rewrite-k2.manifest.json \
+        --reference {{smoke_manifest}} --prompts {{smoke_corpus}} --yes \
+        --out results/reports/{{size}}-rewrite-k2.json
+    uv run dehip report --draft-report results/reports/{{size}}-draft.json \
+        --rewrite-report results/reports/{{size}}-rewrite-k2.json --benchmark \
+        --out results/reports/{{size}}-comparison.json
+
+# Convenience aliases matching the runbook's invocations.
+run-8b:
+    just run-cascade 8B
+
+run-14b:
+    just run-cascade 14B
+
 # Render the smoke-run findings to a branded PDF (Palatino body, Menlo code).
 # Needs pandoc + a xelatex-capable TeX (macOS: MacTeX/BasicTeX). The `#` in
 # "issue #16" is a LaTeX macro char, so the subtitle spells it out.

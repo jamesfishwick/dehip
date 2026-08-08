@@ -150,4 +150,6 @@ it visible.
   seeds (like the stub's 24) for tight bounds instead of one observation.
 - SC-004/SC-005 pass and the real quality verdict need the 4B (or larger) adapter.
   The 4B run cleared SC-005; an 8B or 14B GPU run would test whether the JMQ
-  penalty crosses into quality-neutral.
+  penalty crosses into quality-neutral. The recipe and sizing are ready in
+  `docs/gpu-runbook.md` (`just fetch-adapter 8B` then `just run-cascade 8B`); it
+  needs a CUDA box, which this Mac is not.
