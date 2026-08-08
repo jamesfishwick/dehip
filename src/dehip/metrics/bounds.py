@@ -96,6 +96,7 @@ from math import sqrt
 
 __all__ = [
     "StubInstrumentBounds",
+    "REAL_EMBEDDER_ID",
     "DERIVATION_SEEDS",
     "DERIVATION_CORPUS_ID",
     "Z_JMQ",
@@ -103,6 +104,12 @@ __all__ = [
     "STUB_INSTRUMENT_BOUNDS",
     "REAL_INSTRUMENT_BOUNDS",
 ]
+
+# The real-protocol embedder whose noise floor REAL_INSTRUMENT_BOUNDS describes.
+# Mirrors metrics.embeddings.DEFAULT_EMBEDDER_ID; kept as a local literal so this
+# lightweight module need not import the torch-heavy embeddings module. A drift
+# guard in tests/unit/test_bounds.py asserts the two stay equal.
+REAL_EMBEDDER_ID = "nvidia/llama-embed-nemotron-8b"
 
 # The seeds the stub-instrument bounds were derived over (scripts/derive_bounds
 # uses tuple(range(24)); this must equal that set so the constant, the comment,
@@ -180,14 +187,21 @@ class StubInstrumentBounds:
     jmq_win_rate_max: float = 0.55
 
     @classmethod
-    def documented(cls) -> StubInstrumentBounds:
-        """Return the bounds currently in force (stub instruments today).
+    def documented(cls, embedder_id: str | None = None) -> StubInstrumentBounds:
+        """Return the noise bounds in force for the instrument in ``embedder_id``.
 
-        Once issue #16 fills in :data:`REAL_INSTRUMENT_BOUNDS`, that slot becomes
-        the in-force set for real-instrument runs; until then the stub bounds are
-        authoritative and this returns them.
+        Bounds are only comparable to the instrument that produced them: the real
+        embedder (:data:`REAL_EMBEDDER_ID`) lives in a 4096-dim space with a noise
+        floor near 0, while the stub embedder is a tiny hash whose floor sits an
+        order of magnitude higher. So a run's bounds must match its embedder, not a
+        global default. When ``embedder_id`` is the real embedder AND
+        :data:`REAL_INSTRUMENT_BOUNDS` is filled, return those; otherwise (stub
+        embedder, or ``None`` for an unspecified instrument) return the stub bounds,
+        which are the safe default that the stub tests are calibrated against.
         """
-        return REAL_INSTRUMENT_BOUNDS or STUB_INSTRUMENT_BOUNDS
+        if embedder_id == REAL_EMBEDDER_ID and REAL_INSTRUMENT_BOUNDS is not None:
+            return REAL_INSTRUMENT_BOUNDS
+        return STUB_INSTRUMENT_BOUNDS
 
 
 # In force today. Derived per the module docstring (2026-08-05, stub instruments,
@@ -200,13 +214,30 @@ STUB_INSTRUMENT_BOUNDS = StubInstrumentBounds(
     jmq_win_rate_max=0.55,
 )
 
-# --- Issue #16 slot: real-instrument bounds (FILL IN LATER) ------------------
-# A real smoke run over the FineWeb smoke corpus (50 pairs) with the production
-# embedder (nvidia/llama-embed-nemotron-8b) and Qwen3 tokenizer will re-derive
-# the MMD and token-L2 noise bounds and replace this None with a
-# StubInstrumentBounds(...) carrying its own dated provenance (real embedder id,
-# real tokenizer id, the FineWeb smoke corpus manifest hash, the seeds used, the
-# observed ranges). Until #16 lands, this stays None and StubInstrumentBounds
-# .documented() falls back to STUB_INSTRUMENT_BOUNDS. Do NOT invent these numbers;
-# they must come from a real run.
-REAL_INSTRUMENT_BOUNDS: StubInstrumentBounds | None = None
+# --- Issue #16 slot: real-instrument bounds (FILLED from the smoke run) -------
+# Derivation provenance:
+# - Source: the issue #16 real-instrument smoke self-check, 2026-08-07.
+# - Instruments: embedder nvidia/llama-embed-nemotron-8b (dim 4096, the exact
+#   protocol model), tokenizer Qwen/Qwen3-4B-Instruct-2507. Corpus: the 50-pair
+#   FineWeb smoke corpus (data/corpus/fineweb-smoke.manifest.json).
+# - Observed (single seeded 25-vs-25 human-vs-human split, seed 0):
+#   MMD^2 = 0.000307, token-L2 = 0.0221. A genuine distribution shift measured on
+#   the same instruments scores near 0.4 (MMD) and 0.5+ (token-L2), so the gap
+#   between the noise floor and a real regression is large.
+# - Chosen bounds: generous margins above the single observation, deliberately
+#   looser than a multi-seed derivation would warrant, because one split does not
+#   capture the across-seed variance the way the 24-seed stub derivation did.
+#   mmd_max 0.05 (~160x the observed, far below the ~0.4 regression floor),
+#   mmd_min -0.05 (symmetric, guards a sign-flipped/broken kernel), token_l2_max
+#   0.08 (~3.6x the observed, far below ~0.5). These are tighter than the stub's
+#   0.10/0.10 because the real MMD floor is much smaller, but still safe.
+# TODO(rigor): re-derive over multiple seeds (>= 8, like the stub's 24) for tight
+#   bounds; see scripts/derive_bounds.py. These single-run margins are a first
+#   honest fill, not a rigorous derivation.
+REAL_INSTRUMENT_BOUNDS: StubInstrumentBounds | None = StubInstrumentBounds(
+    mmd_max=0.05,
+    mmd_min=-0.05,
+    token_l2_max=0.08,
+    jmq_win_rate_min=0.45,
+    jmq_win_rate_max=0.55,
+)

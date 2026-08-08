@@ -312,9 +312,11 @@ def test_cli_self_check_exits_4_on_tightened_bounds(tmp_path, monkeypatch):
     """
     manifest = _write_reference(tmp_path, 40)
     _patch_stub_instruments(monkeypatch)
-    # Force the documented bounds to impossible values.
+    # Force the in-force bounds to impossible values. This run uses the stub
+    # embedder, so documented() selects STUB_INSTRUMENT_BOUNDS (not the real set);
+    # patch that constant to drive the run out of bounds and prove the exit-4 path.
     monkeypatch.setattr(
-        "dehip.metrics.bounds.REAL_INSTRUMENT_BOUNDS",
+        "dehip.metrics.bounds.STUB_INSTRUMENT_BOUNDS",
         StubInstrumentBounds(mmd_max=-1.0, token_l2_max=0.0),
     )
 

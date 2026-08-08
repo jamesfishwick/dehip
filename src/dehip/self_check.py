@@ -415,8 +415,17 @@ def run_self_check(
         SelfCheckOutOfBounds: when a metric is out of bounds and
             ``raise_on_violation`` is True.
     """
+    # Resolve the embedder that actually ran, not a config default (NIT). Prefer an
+    # explicit embedder_id, else read it off the injected cache/embedder, so the
+    # report's embedder_id can never silently disagree with the instrument used.
+    # This must precede the bounds default: bounds are instrument-specific, so
+    # documented() selects the real vs stub set from the embedder identity.
+    effective_embedder_id = embedder_id
+    if effective_embedder_id is None and embed_cache is not None:
+        effective_embedder_id = getattr(embed_cache, "embedder_id", None)
+
     if bounds is None:
-        bounds = StubInstrumentBounds.documented()
+        bounds = StubInstrumentBounds.documented(effective_embedder_id)
 
     pair_ids, texts, set_id = load_reference_set(reference_manifest)
     half_a, half_b, dropped = split_pairs(pair_ids, seed=seed)
@@ -433,12 +442,6 @@ def run_self_check(
         "metrics": metrics,
         "seed": seed,
     }
-    # Record the embedder that actually ran, not a config default (NIT). Prefer an
-    # explicit embedder_id, else read it off the injected cache/embedder, so the
-    # report's embedder_id can never silently disagree with the instrument used.
-    effective_embedder_id = embedder_id
-    if effective_embedder_id is None and embed_cache is not None:
-        effective_embedder_id = getattr(embed_cache, "embedder_id", None)
     if effective_embedder_id is not None:
         score_kwargs["embedder_id"] = effective_embedder_id
     if judge_model is not None:
