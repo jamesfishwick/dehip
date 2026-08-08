@@ -132,7 +132,7 @@ it visible.
 | Criterion | Result |
 |---|---|
 | SC-001 self-check | PASS |
-| SC-003 closer on 2 of 3 | PASS (MMD, token-L2; JMQ still down but only -0.11) |
+| SC-003 closer on 2 of 3 | PASS (MMD and token-L2 yes, JMQ still down but only -0.11) |
 | SC-004 degeneration at or under 5% | FAIL (15 of 50) |
 | SC-005 detector at least 30 points | PASS (+0.333) |
 | SC-006 under one day | PASS |
