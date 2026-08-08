@@ -96,6 +96,47 @@ interface itself. The three external seams (hip-run, the embedder, the detector)
 each need one real-integration smoke test, because unit mocks structurally cannot
 catch "the interface I imagined is not the interface that exists."
 
+## 4B run (the real quality test)
+
+Re-ran the cascade with the released Qwen3-4B HIP adapter on the same drafts. The
+4B base runs on CPU through hip-run (no MPS), and it finished in a similar time to
+the 0.6B because early hard-trips kept the subprocess count down. 15 of 50 flagged
+degenerate, so SC-004 still fails. But the quality story changed sharply.
+
+### 0.6B vs 4B (rewrite, both against human)
+
+| | MMD | token-L2 | JMQ | JMQ drop from draft | SC-005 Pangram delta |
+|---|---|---|---|---|---|
+| 0.6B | 0.0014 | 0.0276 | 0.222 | -0.39 (collapse) | +0.273 (FAIL) |
+| 4B | -0.0020 | 0.0239 | 0.457 | -0.11 (mild) | +0.333 (PASS) |
+
+The 4B rewrite's MMD is essentially zero (statistically indistinguishable from
+human-vs-human), so its distribution is fully human. Its JMQ is double the 0.6B's,
+the quality penalty shrank from -0.39 to -0.11, and it clears the SC-005 detector bar
+the 0.6B missed (10 of 35 rewrites scored fully human on Pangram).
+
+### The finding, refined
+
+The story is a scaling curve, not a yes or no. Bigger paraphraser, smaller quality
+penalty. 0.6B drops JMQ by 0.39, the 4B by only 0.11. The line is heading toward
+quality-neutral, and an 8B or 14B might cross into positive. But at 4B, every JMQ
+dimension still dropped, so HIP is still "more human, slightly worse writing," never
+"more human, better writing." The honest answer to the open question, at the tiers
+runnable here: humanization approaches quality-neutral as the model grows, but it is
+not yet prose improvement. That is a more interesting result than either "it works"
+or "it does not." It is a trajectory, and the two-metric-family harness is what makes
+it visible.
+
+### 4B scorecard
+
+| Criterion | Result |
+|---|---|
+| SC-001 self-check | PASS |
+| SC-003 closer on 2 of 3 | PASS (MMD, token-L2; JMQ still down but only -0.11) |
+| SC-004 degeneration at or under 5% | FAIL (15 of 50) |
+| SC-005 detector at least 30 points | PASS (+0.333) |
+| SC-006 under one day | PASS |
+
 ## Known follow-ups
 
 - Test isolation: the score and self-check CLI tests default to the real
