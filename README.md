@@ -8,4 +8,8 @@ See [PLAN.md](PLAN.md) for the full research plan and [REFERENCES.md](REFERENCES
 
 ## Status
 
-Planning. No implementation yet. Phase 0 (zero-training pipeline with released HIP adapters) is next.
+The harness is implemented. All seven `dehip` subcommands are built and covered by unit and integration tests (322 tests): `build-corpus`, `generate`, `rewrite`, `score`, `self-check`, `detect`, and `report`. Each stage reads and writes the file formats in [the data model](specs/001-hip-cascade-harness/data-model.md), gates spend before any judge or detector call, and exits with the codes in [the CLI contract](specs/001-hip-cascade-harness/contracts/cli.md).
+
+What each command does is implemented and tested against injected seams (stub models, judges, and detectors), so the pipeline logic, resumability, cost gates, and exit codes are exercised without downloads or paid calls. Real-instrument validation is a separate step and has not been run: the smoke run on real models, the SC-003 through SC-006 outcomes, and any wall-clock or quality numbers are pending (issue #16). No claim here has been measured on real models.
+
+To drive the pipeline end to end, see [the quickstart](specs/001-hip-cascade-harness/quickstart.md); `just smoke-test` runs that sequence, given the prerequisites (uv, an `OPENAI_API_KEY` for the judge, the HIP sibling checkout, and the models).
