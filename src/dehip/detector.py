@@ -215,6 +215,13 @@ class DetectionReport:
 
 # --- Real SDK adapters (thin glue behind the seam) ---------------------------
 
+#: Default Pangram model. ``pangram-4`` is the model the pangram.com web app
+#: scores against; the older ``default`` model can report a text human where
+#: ``pangram-4`` reports it AI, so the harness must match the web app to be
+#: meaningful. Override per-call via ``PangramClient(model=...)`` or the
+#: ``dehip detect --model`` flag.
+DEFAULT_PANGRAM_MODEL = "pangram-4"
+
 
 class PangramClient:
     """Thin Pangram-SDK glue behind the :class:`DetectorClient` seam.
@@ -224,11 +231,16 @@ class PangramClient:
     :meth:`score_text`; an SDK-import or client-construction failure is
     normalized to :class:`DetectorCallError` (-> CLI exit 3). The key is read
     from ``PANGRAM_API_KEY`` by the SDK itself; the CLI has already enforced its
-    presence before this client is ever constructed.
+    presence before this client is ever constructed. ``model`` selects the
+    Pangram model (see :meth:`Pangram.list_models`) and defaults to
+    :data:`DEFAULT_PANGRAM_MODEL`.
     """
 
-    def __init__(self, *, api_key: str | None = None) -> None:
+    def __init__(
+        self, *, api_key: str | None = None, model: str | None = None
+    ) -> None:
         self._api_key = api_key
+        self._model = model or DEFAULT_PANGRAM_MODEL
         self._client: Any = None
 
     def _ensure_client(self) -> Any:
@@ -258,15 +270,15 @@ class PangramClient:
         ``fraction_human`` (proportion classified human-written), ``fraction_ai``,
         and ``fraction_ai_assisted``. Human-probability is ``fraction_human``
         (falling back to ``1 - fraction_ai`` if only that is present). ``model``
-        is passed explicitly ("default") because omitting it is deprecated and
-        will be rejected after 2026-09-30. Any transport/response failure is
+        (``self._model``) is passed explicitly because omitting it is deprecated
+        and will be rejected after 2026-09-30. Any transport/response failure is
         normalized to :class:`DetectorCallError`; :func:`score_set` also range-
         checks the returned value, so an out-of-range reply never becomes a silent
         score.
         """
         client = self._ensure_client()
         try:
-            result = client.predict(text, model="default")
+            result = client.predict(text, model=self._model)
         except Exception as exc:
             raise DetectorCallError(f"pangram call failed: {exc}") from exc
 
@@ -346,14 +358,19 @@ class GPTZeroClient:
         return 1.0 - generated
 
 
-def build_client(detector: str, *, api_key: str | None = None) -> DetectorClient:
+def build_client(
+    detector: str, *, api_key: str | None = None, model: str | None = None
+) -> DetectorClient:
     """Construct the real adapter for ``detector``.
 
     Called by the CLI only AFTER the key check has passed, so this never runs on
     a keyless machine in a test. Tests inject a mock and never reach here.
+    ``model`` selects the Pangram model (defaults to
+    :data:`DEFAULT_PANGRAM_MODEL`); GPTZero exposes no model choice and ignores
+    it.
     """
     if detector == "pangram":
-        return PangramClient(api_key=api_key)
+        return PangramClient(api_key=api_key, model=model)
     if detector == "gptzero":
         return GPTZeroClient(api_key=api_key)
     raise ValueError(f"unknown detector {detector!r}; valid: {list(DETECTORS)}")
@@ -577,15 +594,46 @@ def score_sets(
 
 # --- SC-005 delta ------------------------------------------------------------
 
+#: Walley IDM imprecision degree (prior mass ``s``). Larger -> wider posterior
+#: envelope, i.e. more caution about the prior. 1-2 is the usual range.
+SC005_IMPRECISION_S = 2.0
 
-def sc005_delta(summaries: Sequence[SetSummary]) -> dict[str, Any] | None:
+
+def _idm_mean_bounds(mean: float, n: int, s: float) -> tuple[float, float]:
+    """Imprecise Beta-Binomial posterior bounds on a [0,1] mean over ``n`` obs.
+
+    Treats the sum of the ``n`` human-probs as effective success mass
+    ``k = mean * n``; sweeping the prior mean across [0, 1] at prior mass ``s``
+    gives lower ``k / (n + s)`` and upper ``(k + s) / (n + s)``. The band is wide
+    at small ``n`` and narrows as ``n`` grows -- the small-sample honesty a point
+    mean hides. ``n <= 0`` returns the vacuous ``[0.0, 1.0]`` (no data, no
+    constraint).
+    """
+    if n <= 0:
+        return 0.0, 1.0
+    k = mean * n
+    return k / (n + s), (k + s) / (n + s)
+
+
+def sc005_delta(
+    summaries: Sequence[SetSummary], *, imprecision_s: float = SC005_IMPRECISION_S
+) -> dict[str, Any] | None:
     """Compute the SC-005 delta (rewrite mean human-prob minus draft mean).
 
     Returns ``None`` unless the summaries contain exactly one draft-role set and
     exactly one rewrite-role set (the two-set SC-005 comparison); otherwise the
     raw per-set summaries stand on their own and the delta is left unset rather
-    than guessed. When both are present, the delta is a single subtraction and
-    ``passed`` records whether it meets :data:`SC005_DELTA_THRESHOLD`.
+    than guessed.
+
+    Degenerate accounting: a cascade that collapses is dropped from the rewrite
+    set, so ``rewrite.n`` can be smaller than ``draft.n``. Those dropped pairs
+    are failures to humanize, not absent data -- scoring the delta over survivors
+    only would inflate it (a run that degenerates 29 of 30 pairs and flips the
+    lone survivor to human would otherwise "pass"). When ``rewrite.n < draft.n``
+    the missing pairs are counted as ``human_prob 0.0`` over the full draft
+    universe: the *effective* rewrite mean is ``rewrite.mean * rewrite.n /
+    draft.n`` and ``passed`` is decided on the effective (conservative) delta.
+    The raw survivor-only ``delta`` is still reported for transparency.
 
     Role mapping: ``instruct_draft`` is the draft baseline; ``rewrite`` is the
     cascade output. A set with any other role does not participate.
@@ -595,15 +643,56 @@ def sc005_delta(summaries: Sequence[SetSummary]) -> dict[str, Any] | None:
     if len(drafts) != 1 or len(rewrites) != 1:
         return None
     draft, rewrite = drafts[0], rewrites[0]
-    delta = rewrite.mean - draft.mean
+    raw_delta = rewrite.mean - draft.mean
+    dropped = max(0, draft.n - rewrite.n)
+    # Dropped pairs degenerated -> count them as unhumanized failures (0.0) in
+    # the full draft universe, so the mean is over draft.n, not the survivors.
+    if dropped and draft.n:
+        rewrite_mean_effective = rewrite.mean * rewrite.n / draft.n
+    else:
+        rewrite_mean_effective = rewrite.mean
+    delta_effective = rewrite_mean_effective - draft.mean
+
+    # Imprecise (Walley IDM) envelope on the delta. Bound each side's mean over a
+    # family of priors and combine worst-case: delta_lower = rewrite_lower minus
+    # draft_upper, delta_upper = rewrite_upper minus draft_lower. The rewrite mass
+    # is taken over the full draft universe so degenerate drops weigh as 0.0.
+    s = imprecision_s
+    n_universe = draft.n or rewrite.n
+    k_rewrite = rewrite.mean * rewrite.n  # effective human mass among survivors
+    d_lower, d_upper = _idm_mean_bounds(draft.mean, draft.n, s)
+    r_lower = k_rewrite / (n_universe + s)
+    r_upper = (k_rewrite + s) / (n_universe + s)
+    delta_lower = r_lower - d_upper
+    delta_upper = r_upper - d_lower
+    if delta_lower >= SC005_DELTA_THRESHOLD:
+        verdict = "robust_pass"
+    elif delta_upper < SC005_DELTA_THRESHOLD:
+        verdict = "robust_fail"
+    else:
+        verdict = "indeterminate"
+    # Transparency on the degeneration assumption: the upper bound if every
+    # dropped pair had instead flipped to human (drops treated as successes).
+    delta_upper_if_drops_human = (k_rewrite + dropped + s) / (n_universe + s) - d_lower
+
     return {
         "draft_set": draft.set_id,
         "rewrite_set": rewrite.set_id,
+        "draft_n": draft.n,
+        "rewrite_n": rewrite.n,
+        "dropped_degenerate": dropped,
         "draft_mean_human_prob": draft.mean,
         "rewrite_mean_human_prob": rewrite.mean,
-        "delta": delta,
+        "rewrite_mean_effective": rewrite_mean_effective,
+        "delta": raw_delta,
+        "delta_effective": delta_effective,
+        "imprecision_s": s,
+        "delta_lower": delta_lower,
+        "delta_upper": delta_upper,
+        "delta_upper_if_drops_human": delta_upper_if_drops_human,
         "threshold": SC005_DELTA_THRESHOLD,
-        "passed": delta >= SC005_DELTA_THRESHOLD,
+        "verdict": verdict,
+        "passed": delta_effective >= SC005_DELTA_THRESHOLD,
     }
 
 

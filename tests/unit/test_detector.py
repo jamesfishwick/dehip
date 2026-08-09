@@ -233,6 +233,50 @@ def test_sc005_delta_two_rewrites_no_draft_returns_none():
     assert det.sc005_delta([rw_a, rw_b]) is None
 
 
+def test_sc005_delta_counts_degenerate_drops_as_failures():
+    # 4 drafts (all AI), but only 2 rewrites survived the cascade -- the other 2
+    # degenerated and were dropped. Survivor-only mean (0.5) would "pass" the raw
+    # delta, but the 2 collapses are failures to humanize: over the full universe
+    # the effective mean is 0.5 * 2/4 = 0.25, below the 0.30 bar.
+    draft = det.summarize_scores("d", "instruct_draft", [0.0, 0.0, 0.0, 0.0])
+    rewrite = det.summarize_scores("r", "rewrite", [0.0, 1.0])  # 2 survivors
+    sc005 = det.sc005_delta([draft, rewrite])
+    assert sc005["dropped_degenerate"] == 2
+    assert sc005["delta"] == pytest.approx(0.5)  # raw survivor-only
+    assert sc005["delta_effective"] == pytest.approx(0.25)  # counts the 2 drops
+    assert sc005["passed"] is False  # 0.25 < 0.30, not the spurious 0.5 pass
+
+
+def test_sc005_envelope_robust_fail_when_upper_below_threshold():
+    # 30 drafts all AI; 19 survivors with 2 flips (mean ~0.105), 11 degenerated.
+    draft = det.summarize_scores("d", "instruct_draft", [0.0] * 30)
+    rewrite = det.summarize_scores("r", "rewrite", [1.0, 1.0] + [0.0] * 17)
+    sc = det.sc005_delta([draft, rewrite], imprecision_s=2.0)
+    assert sc["verdict"] == "robust_fail"
+    assert sc["delta_upper"] < det.SC005_DELTA_THRESHOLD
+    # the adversarial "drops might be human" bound crosses the bar -> the
+    # degeneration assumption is what the verdict hinges on, made explicit.
+    assert sc["delta_upper_if_drops_human"] > det.SC005_DELTA_THRESHOLD
+
+
+def test_sc005_envelope_indeterminate_when_band_straddles():
+    # High point flip but tiny n -> the band straddles 0.30, so "get more data".
+    draft = det.summarize_scores("d", "instruct_draft", [0.0] * 3)
+    rewrite = det.summarize_scores("r", "rewrite", [1.0, 1.0])  # n=2, 1 dropped
+    sc = det.sc005_delta([draft, rewrite], imprecision_s=2.0)
+    assert sc["verdict"] == "indeterminate"
+    assert sc["delta_lower"] < det.SC005_DELTA_THRESHOLD <= sc["delta_upper"]
+
+
+def test_sc005_envelope_robust_pass_needs_lower_above_threshold():
+    # Large n, strong flip -> even the lower bound clears the bar.
+    draft = det.summarize_scores("d", "instruct_draft", [0.0] * 50)
+    rewrite = det.summarize_scores("r", "rewrite", [1.0] * 40 + [0.0] * 10)
+    sc = det.sc005_delta([draft, rewrite], imprecision_s=2.0)
+    assert sc["verdict"] == "robust_pass"
+    assert sc["delta_lower"] >= det.SC005_DELTA_THRESHOLD
+
+
 # --- DoD 2: per-text + summary persistence -----------------------------------
 
 
@@ -650,8 +694,29 @@ def test_pangram_client_reads_fraction_human():
     c = detector.PangramClient()
     c._client = _FakePangramSDK({"fraction_human": 0.83, "fraction_ai": 0.17})
     assert c.score_text("x") == 0.83
-    # model is passed explicitly (deprecation: omitting it is rejected after 2026-09-30)
+    # model is passed explicitly (deprecation: omitting it is rejected after
+    # 2026-09-30) and defaults to the web-app model, not the older "default".
+    assert c._client.calls == [("x", detector.DEFAULT_PANGRAM_MODEL)]
+    assert detector.DEFAULT_PANGRAM_MODEL == "pangram-4"
+
+
+def test_pangram_client_honours_explicit_model():
+    from dehip import detector
+
+    c = detector.PangramClient(model="default")
+    c._client = _FakePangramSDK({"fraction_human": 1.0})
+    c.score_text("x")
     assert c._client.calls == [("x", "default")]
+
+
+def test_build_client_threads_model_to_pangram():
+    from dehip import detector
+
+    c = detector.build_client("pangram", api_key="k", model="default")
+    assert isinstance(c, detector.PangramClient)
+    assert c._model == "default"
+    # None -> the web-app default
+    assert detector.build_client("pangram", api_key="k")._model == "pangram-4"
 
 
 def test_pangram_client_falls_back_to_one_minus_fraction_ai():
