@@ -14,6 +14,14 @@ The result: humanization moves the distribution metrics (MMD, token-L2, the dete
 
 ## Commands
 
+### Running the CLI
+
+`dehip` is a console script inside the project's uv-managed virtualenv, not on your global PATH, so a bare `dehip` gives "command not found". Three ways to run it:
+
+- `uv run dehip <command>` — no setup, uses the project env. This is what the `just` recipes and the quickstart use.
+- `source .venv/bin/activate` then `dehip <command>` — bare `dehip` works for that shell session.
+- `uv tool install --editable .` — puts `dehip` on your global PATH so it works from anywhere (`--editable` picks up code changes without reinstalling).
+
 Single entry point `dehip`, one subcommand per pipeline stage. Every stage reads and writes the formats in [the data model](specs/001-hip-cascade-harness/data-model.md), prints a JSON summary to stdout and human-readable progress to stderr, gates spend before any paid call, and takes `--seed` (recorded in its output). For every flag's valid values and defaults, see the [command reference](docs/commands.md) (or run `dehip <command> --help`); the formal contract and exit codes are in [the CLI contract](specs/001-hip-cascade-harness/contracts/cli.md).
 
 | Command | What it does |
