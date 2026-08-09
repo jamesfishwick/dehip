@@ -1317,6 +1317,40 @@ def test_subprocess_config_includes_base_model_when_overridden(tmp_path, monkeyp
     assert calls[0]["config"]["base_model"] == "Qwen/Qwen3-4B-Base"
 
 
+def test_subprocess_config_omits_loading_knobs_by_default(tmp_path, monkeypatch):
+    """No device_map/bf16/attn keys unless set -> single-device default intact."""
+    calls = _install_fake_hip_run(monkeypatch)
+    runner = cascade_mod.SubprocessHipRunner(tmp_path, work_dir=tmp_path / "work")
+    audit = runner.config_for(round_k=1, adapter_id="ADP")
+    for key in ("device_map", "bf16", "attn_implementation"):
+        assert key not in audit
+
+    runner.run_round({"fineweb-00000": "a draft"}, round_k=1, adapter_id="ADP")
+    for key in ("device_map", "bf16", "attn_implementation"):
+        assert key not in calls[0]["config"]
+
+
+def test_subprocess_config_emits_loading_knobs_for_large_base(tmp_path, monkeypatch):
+    """Multi-GPU passthrough (Llama-3-70B): device_map/bf16/attn reach hip-run."""
+    calls = _install_fake_hip_run(monkeypatch)
+    runner = cascade_mod.SubprocessHipRunner(
+        tmp_path,
+        work_dir=tmp_path / "work",
+        device_map="auto",
+        bf16=True,
+        attn_implementation="sdpa",
+    )
+    audit = runner.config_for(round_k=1, adapter_id="ADP")
+    assert audit["device_map"] == "auto"
+    assert audit["bf16"] is True
+    assert audit["attn_implementation"] == "sdpa"
+
+    runner.run_round({"fineweb-00000": "a draft"}, round_k=1, adapter_id="ADP")
+    assert calls[0]["config"]["device_map"] == "auto"
+    assert calls[0]["config"]["bf16"] is True
+    assert calls[0]["config"]["attn_implementation"] == "sdpa"
+
+
 def test_subprocess_missing_pair_row_fails_loudly(tmp_path, monkeypatch):
     """A parquet omitting a requested pair's row -> HipRunError (never a skip)."""
     _install_fake_hip_run(monkeypatch, drop_indices=(1,))

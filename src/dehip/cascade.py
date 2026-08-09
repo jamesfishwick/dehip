@@ -214,6 +214,9 @@ class SubprocessHipRunner:
         *,
         work_dir: str | Path,
         base_model: str | None = None,
+        device_map: str | None = None,
+        bf16: bool | None = None,
+        attn_implementation: str | None = None,
         temperature: float = 1.0,
         top_p: float = 0.95,
         timeout_s: float = 7200.0,
@@ -224,6 +227,13 @@ class SubprocessHipRunner:
         # PeftConfig (base_model_name_or_path). Only an explicit override is
         # emitted into the config so an adapter never resolves to a wrong base.
         self.base_model = base_model
+        # Large-model loading knobs, passed straight into the hip-run config only
+        # when set (None -> omitted, so the single-device 4B/8B default is
+        # unchanged). device_map="auto" + bf16=True are what a 70B base needs to
+        # shard across GPUs; see configs/infer_llama3_70b_hip.yaml in the HIP repo.
+        self.device_map = device_map
+        self.bf16 = bf16
+        self.attn_implementation = attn_implementation
         # temperature/top_p are the sampling knobs hip-run actually applies
         # (inference.py:118-120). Defaults match the HIP inference protocol
         # (temperature 1.0, top_p 0.95); they are emitted into the config AND
@@ -263,6 +273,15 @@ class SubprocessHipRunner:
         }
         if self.base_model is not None:
             config["base_model"] = self.base_model
+        # Large-model loading passthrough: emitted only when set, so the default
+        # single-device config is byte-identical to before. Needed for multi-GPU
+        # bases like Llama-3-70B (bf16 + device_map=auto + sdpa attention).
+        if self.device_map is not None:
+            config["device_map"] = self.device_map
+        if self.bf16 is not None:
+            config["bf16"] = self.bf16
+        if self.attn_implementation is not None:
+            config["attn_implementation"] = self.attn_implementation
         return config
 
     def run_round(
