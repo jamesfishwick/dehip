@@ -18,3 +18,7 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# Coverage artifacts (pytest --cov)
+.coverage
+htmlcov/

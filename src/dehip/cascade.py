@@ -322,6 +322,12 @@ class SubprocessHipRunner:
         config["input_jsonl"] = str(input_path)
         config["output_parquet"] = str(output_path)
         config["metadata_json"] = str(metadata_path)
+        # Instruct hip-run to trust the base model's remote code. hip-run (not
+        # dehip) does the load, inferring the base from the adapter's PeftConfig,
+        # so the revision pin lives at that boundary: fetch the adapter at a fixed
+        # revision (just fetch-adapter) and hip-run resolves a matching base. See
+        # docs/security.md for the trust model. The config is written with
+        # yaml.safe_dump; the adapter path is dehip-controlled, not user text.
         config["trust_remote_code"] = True
         config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
 

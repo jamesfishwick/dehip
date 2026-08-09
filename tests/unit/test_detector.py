@@ -671,3 +671,64 @@ def test_pangram_client_missing_fields_fails_loudly():
     c._client = _FakePangramSDK({"unexpected": 1})
     with pytest.raises(detector.DetectorCallError):
         c.score_text("x")
+
+
+class _AttrResponse:
+    """An object (not a dict) exposing fraction_* as attributes -- the shape the
+    real pangram SDK returns, which exercises the getattr branch of _field."""
+
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+
+def test_pangram_client_reads_object_response():
+    from dehip import detector
+
+    c = detector.PangramClient()
+    c._client = _FakePangramSDK(_AttrResponse(fraction_human=0.62, fraction_ai=0.38))
+    assert c.score_text("x") == 0.62
+
+
+def test_pangram_client_object_response_fraction_ai_fallback():
+    from dehip import detector
+
+    c = detector.PangramClient()
+    c._client = _FakePangramSDK(_AttrResponse(fraction_ai=0.25))  # no fraction_human
+    assert abs(c.score_text("x") - 0.75) < 1e-9
+
+
+def test_pangram_client_invalid_fraction_human_fails():
+    import pytest
+
+    from dehip import detector
+
+    c = detector.PangramClient()
+    c._client = _FakePangramSDK({"fraction_human": "not-a-number"})
+    with pytest.raises(detector.DetectorCallError):
+        c.score_text("x")
+
+
+def test_pangram_client_invalid_fraction_ai_fails():
+    import pytest
+
+    from dehip import detector
+
+    c = detector.PangramClient()
+    c._client = _FakePangramSDK({"fraction_ai": "not-a-number"})
+    with pytest.raises(detector.DetectorCallError):
+        c.score_text("x")
+
+
+def test_pangram_client_predict_error_is_wrapped():
+    import pytest
+
+    from dehip import detector
+
+    class _Boom:
+        def predict(self, text, model=None):
+            raise RuntimeError("transport blew up")
+
+    c = detector.PangramClient()
+    c._client = _Boom()
+    with pytest.raises(detector.DetectorCallError):
+        c.score_text("x")
