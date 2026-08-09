@@ -14,7 +14,7 @@ The result: humanization moves the distribution metrics (MMD, token-L2, the dete
 
 ## Commands
 
-Single entry point `dehip`, one subcommand per pipeline stage. Every stage reads and writes the formats in [the data model](specs/001-hip-cascade-harness/data-model.md), prints a JSON summary to stdout and human-readable progress to stderr, gates spend before any paid call, and takes `--seed` (recorded in its output). Full flags and semantics are in [the CLI contract](specs/001-hip-cascade-harness/contracts/cli.md).
+Single entry point `dehip`, one subcommand per pipeline stage. Every stage reads and writes the formats in [the data model](specs/001-hip-cascade-harness/data-model.md), prints a JSON summary to stdout and human-readable progress to stderr, gates spend before any paid call, and takes `--seed` (recorded in its output). For every flag's valid values and defaults, see the [command reference](docs/commands.md) (or run `dehip <command> --help`); the formal contract and exit codes are in [the CLI contract](specs/001-hip-cascade-harness/contracts/cli.md).
 
 | Command | What it does |
 |---|---|
