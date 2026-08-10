@@ -22,3 +22,11 @@ __pycache__/
 # Coverage artifacts (pytest --cov)
 .coverage
 htmlcov/
+
+# Vale: track config/vocab only; packages re-download via `vale sync`
+styles/*
+!styles/config/
+
+# Skill-install byproducts (the skill itself lives in ~/.claude/skills)
+skills-lock.json
+.agents/
