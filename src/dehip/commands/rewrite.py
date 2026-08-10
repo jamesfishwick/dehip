@@ -26,6 +26,24 @@ def _add_rewrite(subparsers: argparse._SubParsersAction) -> None:
     # match the HIP inference protocol (temperature 1.0, top_p 0.95).
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.95, dest="top_p")
+    # Large-model loading passthrough (omitted from the hip-run config unless set,
+    # so the single-device 4B/8B default is unchanged). Needed for multi-GPU bases
+    # like Llama-3-70B: --device-map auto --bf16 --attn-implementation sdpa.
+    parser.add_argument(
+        "--device-map",
+        dest="device_map",
+        help="hip-run device_map, e.g. 'auto' to shard a large base across GPUs.",
+    )
+    parser.add_argument(
+        "--bf16",
+        action=argparse.BooleanOptionalAction,
+        help="Load the base in bf16 (needed for large bases like Llama-3-70B).",
+    )
+    parser.add_argument(
+        "--attn-implementation",
+        dest="attn_implementation",
+        help="hip-run attn_implementation, e.g. 'sdpa'.",
+    )
     parser.add_argument(
         "--hip-repo", default="../humanization-by-iterative-paraphrasing"
     )
@@ -110,6 +128,9 @@ def _run_rewrite(args: argparse.Namespace) -> int:
         work_dir=Path(run_dir) / "hip-work",
         temperature=args.temperature,
         top_p=args.top_p,
+        device_map=args.device_map,
+        bf16=args.bf16,
+        attn_implementation=args.attn_implementation,
     )
     try:
         summary = cascade_mod.run_cascade(

@@ -145,7 +145,7 @@ def _run_detect(args: argparse.Namespace) -> int:
 
     # Build the real adapter only now -- after the key check and cost gate both
     # passed. It is the injectable seam; tests inject a mock and never reach here.
-    client = detector_mod.build_client(args.detector)
+    client = detector_mod.build_client(args.detector, model=args.model)
 
     started = detector_mod._now_iso()
     try:
@@ -204,6 +204,11 @@ def _run_detect(args: argparse.Namespace) -> int:
             "seed": args.seed,
             "status": status,
             "detector": args.detector,
+            "model": (
+                (args.model or detector_mod.DEFAULT_PANGRAM_MODEL)
+                if args.detector == "pangram"
+                else None
+            ),
             "n_sets": report.n_sets,
             "out": str(summary_path),
             "scores": str(scores_path),
@@ -223,6 +228,11 @@ def _add_detect(subparsers: argparse._SubParsersAction) -> None:
         "--sets", nargs="+", required=True, help="One or more set manifests."
     )
     parser.add_argument("--detector", choices=("pangram", "gptzero"), default="pangram")
+    parser.add_argument(
+        "--model",
+        help="Pangram model id: 'pangram-4' (default, matches the pangram.com "
+        "web app) or 'default' (older, more permissive). Ignored by gptzero.",
+    )
     parser.add_argument("--out", help="Output report path.")
     parser.add_argument(
         "--yes",
