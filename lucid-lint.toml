@@ -1,0 +1,7 @@
+# lucid-lint — cognitive-accessibility linter, tuned for a technical audience.
+[default]
+profile = "dev-doc"
+exclude = ["styles/**"]
+
+[rules."lexicon.unexplained-abbreviation"]
+whitelist = ["CRUD"]
